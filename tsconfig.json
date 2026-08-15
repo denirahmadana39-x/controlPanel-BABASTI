@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/types" },
+    { "path": "./packages/config" },
+    { "path": "./packages/shared" },
+    { "path": "./packages/validation" },
+    { "path": "./apps/api" },
+    { "path": "./services/node-agent" }
+  ]
+}

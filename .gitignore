@@ -1,0 +1,23 @@
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.local
+data/
+*.tsbuildinfo
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Prisma generated client
+**/generated/
+
+# Local hosting storage (releases, nginx, sites)
+storage/
+

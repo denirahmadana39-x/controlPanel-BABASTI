@@ -1,0 +1,29 @@
+{
+  "name": "@babasti/node-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@babasti/config": "1.0.0",
+    "@babasti/shared": "1.0.0",
+    "@babasti/types": "1.0.0",
+    "@fastify/helmet": "^12.0.1",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.2.0",
+    "yauzl": "^3.1.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/yauzl": "^2.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

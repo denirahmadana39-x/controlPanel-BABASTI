@@ -1,0 +1,279 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum WebsiteStatus {
+  ONLINE
+  DEPLOYING
+  FAILED
+  OFFLINE
+}
+
+enum DeploymentStatus {
+  QUEUED
+  PREPARING
+  UPLOADING
+  CLONING
+  INSTALLING
+  BUILDING
+  PUBLISHING
+  CONFIGURING
+  HEALTH_CHECK
+  SUCCESS
+  FAILED
+  CANCELLED
+}
+
+enum DeploymentSource {
+  ZIP
+  GITHUB
+}
+
+enum DeploymentLogLevel {
+  INFO
+  WARN
+  ERROR
+}
+
+enum DomainStatus {
+  PENDING
+  ACTIVE
+  FAILED
+}
+
+enum EnvVarVisibility {
+  PUBLIC
+  SECRET
+}
+
+enum HostingNodeStatus {
+  ONLINE
+  OFFLINE
+  DRAINING
+}
+
+enum ReleaseStatus {
+  ACTIVE
+  SUPERSEDED
+  FAILED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String?
+  displayName  String
+  role         Role     @default(USER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  accounts   Account[]
+  sessions   Session[]
+  websites   Website[]
+  deployments Deployment[]
+  gitRepositories GitRepository[]
+}
+
+model Account {
+  id                String   @id @default(cuid())
+  userId            String
+  provider          String // "google" | "github"
+  providerAccountId String
+  accessToken       String? // encrypted at rest
+  refreshToken      String?
+  expiresAt         DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique // opaque session token
+  expiresAt DateTime
+  userAgent String?
+  ip        String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Website {
+  id              String        @id @default(cuid())
+  userId          String
+  name            String
+  slug            String        @unique
+  description     String        @default("")
+  status          WebsiteStatus @default(OFFLINE)
+  defaultDomain   String        @unique
+  currentReleaseId String?
+  lastDeploymentId String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deployments     Deployment[]
+  domains         Domain[]
+  environmentVariables EnvironmentVariable[]
+  releases        Release[]
+  usage           Usage[]
+  gitRepositories GitRepository[]
+
+  @@index([userId])
+}
+
+model Domain {
+  id         String       @id @default(cuid())
+  websiteId  String
+  domain     String
+  isDefault  Boolean      @default(false)
+  status     DomainStatus @default(PENDING)
+  verifiedAt DateTime?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@unique([domain])
+  @@index([websiteId])
+}
+
+model Deployment {
+  id              String           @id @default(cuid())
+  websiteId       String
+  userId          String
+  source          DeploymentSource
+  status          DeploymentStatus @default(QUEUED)
+  releaseId       String?
+  nodeId          String?
+  // Build configuration snapshot
+  githubRepo      String?
+  githubBranch    String?
+  commitSha       String?
+  installCommand  String?
+  buildCommand    String?
+  outputDirectory String?
+  // Artifact reference (for ZIP uploads) stored by the storage layer.
+  artifactKey     String?
+  releaseNumber   Int?
+  logSummary      String?
+  startedAt       DateTime?
+  finishedAt      DateTime?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  website Website          @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  user    User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  logs    DeploymentLog[]
+  release Release?
+
+  @@index([websiteId])
+  @@index([userId])
+}
+
+model DeploymentLog {
+  id           String             @id @default(cuid())
+  deploymentId String
+  level        DeploymentLogLevel @default(INFO)
+  message      String
+  sequence     Int
+  timestamp    DateTime           @default(now())
+
+  deployment Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+
+  @@index([deploymentId])
+}
+
+model Release {
+  id            String        @id @default(cuid())
+  websiteId     String
+  deploymentId  String        @unique
+  releaseNumber Int
+  status        ReleaseStatus @default(ACTIVE)
+  path          String // release directory name (relative to site root)
+  createdAt     DateTime      @default(now())
+
+  website    Website     @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  deployment Deployment  @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+
+  @@unique([websiteId, releaseNumber])
+  @@index([websiteId])
+}
+
+model EnvironmentVariable {
+  id         String           @id @default(cuid())
+  websiteId  String
+  key        String
+  value      String // encrypted at rest
+  visibility EnvVarVisibility @default(SECRET)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@unique([websiteId, key])
+  @@index([websiteId])
+}
+
+model GitRepository {
+  id            String   @id @default(cuid())
+  userId        String
+  websiteId     String?
+  provider      String   @default("github")
+  name          String // e.g. "example/my-project"
+  defaultBranch String   @default("main")
+  accessToken   String? // encrypted at rest
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  website Website? @relation(fields: [websiteId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+}
+
+model HostingNodeReference {
+  id            String           @id @default(cuid())
+  name          String           @unique
+  status        HostingNodeStatus @default(OFFLINE)
+  baseUrl       String?
+  token         String? // node registration token (never exposed to clients)
+  registeredAt  DateTime?
+  lastHeartbeat DateTime?
+  capabilities  String? // JSON, reserved for future scheduling
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+}
+
+model Usage {
+  id             String   @id @default(cuid())
+  websiteId      String
+  period         String // e.g. "2026-08"
+  storageBytes   BigInt   @default(0)
+  bandwidthBytes BigInt   @default(0)
+  deploymentsCount Int    @default(0)
+  updatedAt      DateTime @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@unique([websiteId, period])
+  @@index([websiteId])
+}

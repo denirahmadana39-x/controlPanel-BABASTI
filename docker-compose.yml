@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: babasti-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: babasti
+      POSTGRES_PASSWORD: babasti_dev_password
+      POSTGRES_DB: babasti
+    ports:
+      - "5432:5432"
+    volumes:
+      - babasti-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U babasti -d babasti"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: babasti-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - babasti-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  babasti-postgres-data:
+  babasti-redis-data:
