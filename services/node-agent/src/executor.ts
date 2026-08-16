@@ -530,6 +530,20 @@ function buildNginx(domains: string[], root: string): string {
   ].join("\n");
 }
 
+export function rewriteNginxForValidation(
+  nginx: string,
+  port: number,
+): string {
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    throw new Error("invalid nginx validation port");
+  }
+  return nginx.replace(
+    /(^\s*listen\s+)80(\s*;)/gm,
+    (_match, prefix: string, suffix: string) =>
+      `${prefix}127.0.0.1:${port}${suffix}`,
+  );
+}
+
 async function validateNginx(configPath: string): Promise<boolean> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
@@ -542,9 +556,21 @@ async function validateNginx(configPath: string): Promise<boolean> {
   // full config that includes it — this matches real-world usage.
   const dir = path.dirname(configPath);
   const wrapper = path.join(dir, "_nginxtest.conf");
+  const validationSnippet = path.join(dir, "_nginxtest-site.conf");
   const pidFile = path.join(dir, "_nginxtest.pid");
   const errLog = path.join(dir, "_nginxtest_error.log");
   const tempDir = path.join(dir, "_nginxtemp");
+  // nginx -t opens listening sockets while validating a standalone config.
+  // The Agent intentionally runs without root privileges, so validate the
+  // generated snippet on an unprivileged loopback port. The installed site
+  // config keeps its real `listen 80` directive and is validated again as
+  // part of the host's main nginx configuration before reload.
+  const validationPort = 49152 + (process.pid % 15000);
+  const config = await fs.readFile(configPath, "utf8");
+  await fs.writeFile(
+    validationSnippet,
+    rewriteNginxForValidation(config, validationPort),
+  );
   await fs.mkdir(tempDir, { recursive: true });
   await fs.writeFile(
     wrapper,
@@ -559,7 +585,7 @@ async function validateNginx(configPath: string): Promise<boolean> {
       `    uwsgi_temp_path ${JSON.stringify(tempDir)};`,
       `    scgi_temp_path ${JSON.stringify(tempDir)};`,
       "    access_log off;",
-      `    include ${JSON.stringify(configPath)};`,
+      `    include ${JSON.stringify(validationSnippet)};`,
       "}",
       "",
     ].join("\n"),
@@ -585,7 +611,7 @@ async function validateNginx(configPath: string): Promise<boolean> {
     logger.error("nginx validation failed", msg);
     return false;
   } finally {
-    for (const f of [wrapper, pidFile, errLog, tempDir]) {
+    for (const f of [wrapper, validationSnippet, pidFile, errLog, tempDir]) {
       try {
         await fs.rm(f, { recursive: true, force: true });
       } catch {
