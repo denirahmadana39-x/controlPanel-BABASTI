@@ -13,6 +13,10 @@ const rawBoolean = z
   .optional()
   .transform((value) => value === "true" || value === "1");
 
+// OAuth is optional for API deployments and unused by Node Agents. Accept an
+// empty value while still validating configured callback URLs.
+const optionalUrl = z.union([z.literal(""), z.string().url()]).default("");
+
 const configSchema = z.object({
   NODE_ENV: z
     .enum(["development", "test", "production"])
@@ -30,11 +34,11 @@ const configSchema = z.object({
 
   GOOGLE_CLIENT_ID: z.string().optional().default(""),
   GOOGLE_CLIENT_SECRET: z.string().optional().default(""),
-  GOOGLE_CALLBACK_URL: z.string().url().optional().default(""),
+  GOOGLE_CALLBACK_URL: optionalUrl,
 
   GITHUB_CLIENT_ID: z.string().optional().default(""),
   GITHUB_CLIENT_SECRET: z.string().optional().default(""),
-  GITHUB_CALLBACK_URL: z.string().url().optional().default(""),
+  GITHUB_CALLBACK_URL: optionalUrl,
 
   DEPLOYMENT_PROVIDER: z.enum(["mock", "real"]).default("mock"),
 
