@@ -107,9 +107,6 @@ export class NodeExecutor {
     await fs.rm(this.siteRoot(input.slug), { recursive: true, force: true });
     if (this.nginxConfigDir) {
       await fs.rm(this.systemNginxConfig(input.slug), { force: true });
-      if (!(await validateSystemNginx(this.nginxBinary))) {
-        throw new Error("nginx validation failed after website removal");
-      }
       await reloadSystemNginx(this.nginxBinary);
     }
   }
@@ -366,12 +363,12 @@ export class NodeExecutor {
     await fs.writeFile(temporary, nginx, { flag: "wx" });
     await fs.rename(temporary, destination);
 
-    if (!(await validateSystemNginx(this.nginxBinary))) {
-      if (previous) await fs.writeFile(destination, previous);
-      else await fs.rm(destination, { force: true });
-      return false;
-    }
     try {
+      // The generated server block was validated above on an unprivileged
+      // port. Signal the existing root-owned nginx master to atomically load
+      // the installed config; the subsequent site health check confirms that
+      // the master accepted it. This keeps the network-facing Agent non-root
+      // and compatible with systemd NoNewPrivileges=yes.
       await reloadSystemNginx(this.nginxBinary);
       return true;
     } catch (error) {
@@ -618,18 +615,6 @@ async function validateNginx(configPath: string): Promise<boolean> {
         /* ignore */
       }
     }
-  }
-}
-
-async function validateSystemNginx(binary: string): Promise<boolean> {
-  const { execFile } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  try {
-    await promisify(execFile)(binary, ["-t"]);
-    return true;
-  } catch (error) {
-    logger.error("system nginx validation failed", error);
-    return false;
   }
 }
 
