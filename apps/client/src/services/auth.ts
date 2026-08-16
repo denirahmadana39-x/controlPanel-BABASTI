@@ -1,4 +1,4 @@
-import { api } from "@/lib/api";
+import { api, apiUrl } from "@/lib/api";
 import type { User, OverviewData, GithubRepo, SessionInfo } from "./types";
 
 export const authService = {
@@ -12,7 +12,7 @@ export const authService = {
     currentPassword: string;
     newPassword: string;
   }) => api.post<{ success: boolean }>("/auth/password"),
-  googleUrl: () => "/api/auth/google",
+  googleUrl: () => apiUrl("/auth/google"),
 };
 
 export const userService = {
@@ -39,7 +39,7 @@ export const overviewService = {
 };
 
 export const githubService = {
-  connectUrl: () => "/api/github/connect",
+  connectUrl: () => apiUrl("/github/connect"),
   listRepositories: () =>
     api.get<{ connected: boolean; items: GithubRepo[] }>(
       "/github/repositories",

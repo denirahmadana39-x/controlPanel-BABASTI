@@ -1,3 +1,5 @@
+import { resolveApiBaseUrl } from "./api-base-url";
+
 export class ApiError extends Error {
   code: string;
   status: number;
@@ -9,7 +11,11 @@ export class ApiError extends Error {
   }
 }
 
-const BASE_URL = import.meta.env.VITE_API_URL || "/api";
+const BASE_URL = resolveApiBaseUrl(import.meta.env.VITE_API_URL, window.location);
+
+export function apiUrl(path: string): string {
+  return new URL(`${BASE_URL}${path}`, window.location.origin).toString();
+}
 
 export interface RequestOptions {
   method?: string;
@@ -21,7 +27,7 @@ export interface RequestOptions {
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const url = new URL(`${BASE_URL}${path}`, window.location.origin);
+  const url = new URL(apiUrl(path));
   if (options.query) {
     for (const [key, value] of Object.entries(options.query)) {
       if (value !== undefined && value !== null && value !== "") {

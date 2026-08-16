@@ -2,7 +2,7 @@ import * as React from "react";
 import { useForm } from "react-hook-form";
 import { Trash2 } from "lucide-react";
 import { useUserProfile, useUpdateProfile, useSessions, useRevokeSession } from "@/hooks/queries";
-import { authService } from "@/services/auth";
+import { authService, githubService } from "@/services/auth";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
@@ -152,7 +152,13 @@ function ConnectedSection({
               {connected ? (
                 <span className="text-sm text-success">Connected</span>
               ) : (
-                <a href={`/api/auth/${p}`}>
+                <a
+                  href={
+                    p === "google"
+                      ? authService.googleUrl()
+                      : githubService.connectUrl()
+                  }
+                >
                   <Button size="sm" variant="outline">
                     Connect
                   </Button>
