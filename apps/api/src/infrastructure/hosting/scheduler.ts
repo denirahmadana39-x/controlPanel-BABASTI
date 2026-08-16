@@ -1,5 +1,7 @@
 import { prisma } from "../database/prisma.js";
 import { AppError, ErrorCode } from "@babasti/shared";
+import { loadConfig } from "@babasti/config";
+import { decryptNullable } from "../crypto/encryption.js";
 import type { HostingNode } from "./types.js";
 
 /**
@@ -14,6 +16,40 @@ const MOCK_NODE: HostingNode = {
   name: "Mock Node",
   status: "ONLINE",
 };
+
+type NodeRecord = Awaited<
+  ReturnType<typeof prisma.hostingNodeReference.findUnique>
+>;
+
+function decodeNodeToken(value: string | null): string | null {
+  if (!value) return null;
+  try {
+    return decryptNullable(value);
+  } catch {
+    // Compatibility for nodes registered before token-at-rest encryption was
+    // introduced. The next registration replaces it with encrypted data.
+    return value;
+  }
+}
+
+function isFresh(node: NonNullable<NodeRecord>): boolean {
+  const ttlMs = loadConfig().NODE_HEARTBEAT_TTL_SECONDS * 1000;
+  const lastSeen =
+    node.lastHeartbeat ?? node.registeredAt ?? node.updatedAt ?? node.createdAt;
+  return lastSeen.getTime() >= Date.now() - ttlMs;
+}
+
+function toHostingNode(node: NonNullable<NodeRecord>): HostingNode {
+  const config = loadConfig();
+  return {
+    id: node.id,
+    name: node.name,
+    status: node.status as HostingNode["status"],
+    baseUrl: node.baseUrl || config.NODE_AGENT_URL || null,
+    token: decodeNodeToken(node.token) || config.NODE_AGENT_TOKEN || null,
+    dnsTarget: node.dnsTarget,
+  };
+}
 
 export async function chooseNode(
   providerName: string,
@@ -31,11 +67,23 @@ export async function chooseNode(
     return null;
   }
 
+  const freshNodes = nodes.filter(isFresh);
+  const staleIds = nodes
+    .filter((node) => !isFresh(node))
+    .map((node) => node.id);
+  if (staleIds.length > 0) {
+    await prisma.hostingNodeReference.updateMany({
+      where: { id: { in: staleIds }, status: "ONLINE" },
+      data: { status: "OFFLINE" },
+    });
+  }
+  if (freshNodes.length === 0) return null;
+
   // Deterministic selection: pick the node with the fewest websites, falling
   // back to alphabetical order for stability. A simple, swappable heuristic.
-  let best = nodes[0];
+  let best = freshNodes[0];
   let bestCount = await countWebsitesOnNode(best.id);
-  for (const node of nodes.slice(1)) {
+  for (const node of freshNodes.slice(1)) {
     const count = await countWebsitesOnNode(node.id);
     if (count < bestCount) {
       best = node;
@@ -43,21 +91,49 @@ export async function chooseNode(
     }
   }
 
-  return {
-    id: best.id,
-    name: best.name,
-    status: best.status as HostingNode["status"],
-  };
+  return toHostingNode(best);
 }
 
 async function countWebsitesOnNode(nodeId: string): Promise<number> {
-  // We track node assignment via the latest deployment's nodeId. A lightweight
-  // proxy for capacity used by the scheduler.
-  const result = await prisma.deployment.groupBy({
-    by: ["websiteId"],
-    where: { nodeId },
+  return prisma.website.count({ where: { nodeId } });
+}
+
+/** Resolve an existing placement. DRAINING nodes keep serving their assigned
+ * websites but are excluded from new placement by chooseNode(). */
+export async function getNodeById(
+  providerName: string,
+  nodeId: string | null | undefined,
+): Promise<HostingNode | null> {
+  if (!nodeId) return null;
+  if (providerName === "mock") {
+    return nodeId === MOCK_NODE.id ? MOCK_NODE : null;
+  }
+  const node = await prisma.hostingNodeReference.findUnique({
+    where: { id: nodeId },
   });
-  return result.length;
+  if (!node || node.status === "OFFLINE") return null;
+  if (!isFresh(node)) {
+    await prisma.hostingNodeReference.update({
+      where: { id: node.id },
+      data: { status: "OFFLINE" },
+    });
+    return null;
+  }
+  return toHostingNode(node);
+}
+
+export async function requireNodeById(
+  providerName: string,
+  nodeId: string | null | undefined,
+): Promise<HostingNode> {
+  const node = await getNodeById(providerName, nodeId);
+  if (!node) {
+    throw new AppError(
+      ErrorCode.NODE_UNAVAILABLE,
+      "The website's hosting node is unavailable",
+    );
+  }
+  return node;
 }
 
 export async function assertNodeAvailable(

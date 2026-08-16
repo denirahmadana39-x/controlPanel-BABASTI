@@ -50,19 +50,24 @@
 - **The browser never talks to Proxmox or any hypervisor.** The control plane
   orchestrates; the Node Agent is the only component that executes on a hosting
   node. The control plane itself never runs shell commands against nodes.
-- The control plane ↔ Node Agent channel is authenticated with a shared
-  `NODE_AGENT_TOKEN` bearer header. Every `/internal/*` callback handled by the
-  control plane **and** every `/v1/*` endpoint handled by the agent requires the
-  token; a missing or invalid token is rejected with **403 Forbidden**.
-- Deployment artifacts are streamed and extracted in a sandboxed temp dir; only
-  the resolved output directory is promoted to an immutable release.
+- Each Node Agent has its own `NODE_AGENT_TOKEN`; the separate
+  `NODE_REGISTRATION_TOKEN` can only register nodes. Agent tokens are encrypted
+  at rest by the control plane. Every `/internal/*` request and every `/v1/*`
+  endpoint requires an accepted bearer token; invalid tokens receive **403**.
+- Agent hostnames can additionally be protected by Cloudflare Access. When a
+  service token is configured, the control plane attaches its Access headers
+  without replacing the per-node bearer token. The public customer wildcard
+  must not require Access authentication.
+- Deployment artifacts are extracted into a node-local staging path with path
+  traversal, entry-count, and expanded-size limits. This is filesystem
+  hardening, not an OS sandbox for untrusted application execution.
 - **nginx is validated before any live change.** The agent wraps the generated
   vhost snippet in a complete temp `http { }` config and runs `nginx -t`. A
   failing check leaves the live config untouched and the deployment is marked
   `FAILED` — a bad release can never break the running server.
-- **No arbitrary shell execution.** The agent runs a small, fixed set of commands
-  (extract, symlink swap, `nginx -t`, reload). It does not accept or evaluate
-  free-form shell from the control plane.
+- **No arbitrary shell execution.** Static publishing runs a fixed set of
+  operations (extract, symlink swap, `nginx -t`, reload). User-provided build
+  commands are not executed until a separate container sandbox is implemented.
 
 ## Operational
 

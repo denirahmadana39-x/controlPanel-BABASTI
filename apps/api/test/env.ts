@@ -26,6 +26,10 @@ process.env.REDIS_URL = "";
 process.env.SESSION_SECRET = "test-session-secret-at-least-16-characters";
 process.env.SESSION_TTL = "604800";
 process.env.DEPLOYMENT_PROVIDER = process.env.DEPLOYMENT_PROVIDER ?? "mock";
+process.env.NODE_AGENT_TOKEN =
+  process.env.NODE_AGENT_TOKEN ?? "test-node-agent-token-32-characters";
+process.env.NODE_REGISTRATION_TOKEN =
+  process.env.NODE_REGISTRATION_TOKEN ?? "test-node-registration-token-32-characters";
 process.env.STORAGE_PATH = path.join(
   os.tmpdir(),
   `babasti-test-${process.pid}`,

@@ -1,6 +1,9 @@
 import { prisma } from "../../infrastructure/database/prisma.js";
 import { getHostingProvider } from "../../infrastructure/hosting/index.js";
-import { assertNodeAvailable, chooseNode } from "../../infrastructure/hosting/scheduler.js";
+import {
+  assertNodeAvailable,
+  requireNodeById,
+} from "../../infrastructure/hosting/scheduler.js";
 import { getStorage } from "../../infrastructure/storage/index.js";
 import { getQueue } from "../../infrastructure/queue/index.js";
 import {
@@ -12,6 +15,7 @@ import type { HostingNode } from "../../infrastructure/hosting/types.js";
 import { AppError, ErrorCode, generateId, logger } from "@babasti/shared";
 import type { DeployContext, DeployHooks } from "../../infrastructure/hosting/types.js";
 import { isRejectableTransition } from "../../infrastructure/hosting/state-machine.js";
+import { loadConfig } from "@babasti/config";
 
 async function appendLog(
   deploymentId: string,
@@ -81,12 +85,36 @@ export async function processDeployJob(deploymentId: string): Promise<void> {
     logger.warn(`Deploy job for missing deployment ${deploymentId}`);
     return;
   }
+  if (deployment.status === DeploymentStatus.CANCELLED) {
+    if (deployment.artifactKey) {
+      await getStorage().deleteArtifact(deployment.artifactKey).catch((error) =>
+        logger.warn("Cancelled deployment artifact cleanup failed", error),
+      );
+    }
+    return;
+  }
 
   const { website, customDomains } = await resolveWebsiteContext(
     deployment.websiteId,
   );
   const providerName = getHostingProvider().name;
-  const node: HostingNode | null = await chooseNode(providerName);
+  const assignedNodeId = deployment.nodeId ?? website.nodeId;
+  const node: HostingNode = assignedNodeId
+    ? await requireNodeById(providerName, assignedNodeId)
+    : await assertNodeAvailable(providerName);
+  // Snapshot the placement on the deployment and pin a previously unassigned
+  // website. Never silently move an existing website between nodes because its
+  // immutable releases live on the original node.
+  await prisma.$transaction([
+    prisma.deployment.update({
+      where: { id: deployment.id },
+      data: { nodeId: node.id },
+    }),
+    prisma.website.updateMany({
+      where: { id: website.id, nodeId: null },
+      data: { nodeId: node.id },
+    }),
+  ]);
   const hooks = buildHooks(deploymentId);
 
   const ctx: DeployContext = {
@@ -132,6 +160,12 @@ export async function processDeployJob(deploymentId: string): Promise<void> {
       website,
       (error as Error).message,
     );
+  } finally {
+    if (deployment.artifactKey) {
+      await getStorage().deleteArtifact(deployment.artifactKey).catch((error) =>
+        logger.warn("Deployment artifact cleanup failed", error),
+      );
+    }
   }
 }
 
@@ -223,7 +257,10 @@ export async function processRollbackJob(deploymentId: string): Promise<void> {
     deployment.websiteId,
   );
   const providerName = getHostingProvider().name;
-  const node = await chooseNode(providerName);
+  const node = await requireNodeById(
+    providerName,
+    deployment.nodeId ?? website.nodeId,
+  );
   const hooks = buildHooks(deploymentId);
 
   const result = await getHostingProvider().rollbackWebsite(
@@ -281,9 +318,16 @@ async function updateUsage(websiteId: string, slug: string): Promise<void> {
   const period = new Date().toISOString().slice(0, 7);
   const deploymentsCount = await prisma.deployment.count({ where: { websiteId } });
   const provider = getHostingProvider();
+  const website = await prisma.website.findUnique({
+    where: { id: websiteId },
+    select: { nodeId: true },
+  });
   let storageBytes = 0n;
   try {
-    const usage = await provider.getUsage({ websiteId, slug });
+    const node = website?.nodeId
+      ? await requireNodeById(provider.name, website.nodeId)
+      : undefined;
+    const usage = await provider.getUsage({ websiteId, slug, node });
     storageBytes = BigInt(usage.storageBytes);
   } catch {
     storageBytes = 0n;
@@ -322,7 +366,56 @@ export async function createDeployment(
   });
   if (!website) throw new AppError(ErrorCode.WEBSITE_NOT_FOUND);
 
-  await assertNodeAvailable(getHostingProvider().name);
+  const providerName = getHostingProvider().name;
+  if (providerName === "real" && params.source === "GITHUB") {
+    throw new AppError(
+      ErrorCode.BAD_REQUEST,
+      "GitHub deployments are not available until sandboxed builds are enabled",
+    );
+  }
+  if (providerName === "real" && params.zipConfig?.buildCommand) {
+    throw new AppError(
+      ErrorCode.BAD_REQUEST,
+      "Server-side build commands are not available until build isolation is enabled",
+    );
+  }
+  const config = loadConfig();
+  const dayStart = new Date();
+  dayStart.setUTCHours(0, 0, 0, 0);
+  const [deploymentsToday, activeDeployments] = await Promise.all([
+    prisma.deployment.count({
+      where: { userId: params.userId, createdAt: { gte: dayStart } },
+    }),
+    prisma.deployment.count({
+      where: {
+        userId: params.userId,
+        status: { notIn: ["SUCCESS", "FAILED", "CANCELLED"] },
+      },
+    }),
+  ]);
+  if (deploymentsToday >= config.MAX_DEPLOYMENTS_PER_DAY) {
+    throw new AppError(
+      ErrorCode.QUOTA_EXCEEDED,
+      `Your plan allows ${config.MAX_DEPLOYMENTS_PER_DAY} deployments per day`,
+    );
+  }
+  if (activeDeployments >= config.MAX_CONCURRENT_DEPLOYMENTS_PER_USER) {
+    throw new AppError(
+      ErrorCode.QUOTA_EXCEEDED,
+      "Wait for the current deployment to finish before starting another",
+    );
+  }
+
+  const node = website.nodeId
+    ? await requireNodeById(providerName, website.nodeId)
+    : await assertNodeAvailable(providerName);
+
+  if (!website.nodeId) {
+    await prisma.website.update({
+      where: { id: website.id },
+      data: { nodeId: node.id },
+    });
+  }
 
   const deployment = await prisma.deployment.create({
     data: {
@@ -330,6 +423,7 @@ export async function createDeployment(
       userId: params.userId,
       source: params.source,
       status: DeploymentStatus.QUEUED,
+      nodeId: node.id,
       artifactKey: params.artifactKey,
       githubRepo: params.githubConfig?.repository,
       githubBranch: params.githubConfig?.branch,

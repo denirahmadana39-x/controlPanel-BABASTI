@@ -13,12 +13,11 @@ import {
 } from "@babasti/validation";
 import { DeploymentStatus } from "@babasti/types";
 import { ok } from "../../shared/http.js";
+import { loadConfig } from "@babasti/config";
 import {
   createDeployment,
   enqueueRollback,
 } from "./deployment.service.js";
-
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
 
 async function ownWebsite(websiteId: string, userId: string) {
   const website = await prisma.website.findFirst({
@@ -150,9 +149,24 @@ async function handleZipDeploy(
   if (!data) {
     throw new AppError(ErrorCode.BAD_REQUEST, "No file uploaded");
   }
-  const buffer = await data.toBuffer();
-  if (buffer.byteLength > MAX_UPLOAD_BYTES) {
-    throw new AppError(ErrorCode.UPLOAD_TOO_LARGE, "Archive exceeds 50 MB limit");
+  const maxUploadBytes = loadConfig().MAX_UPLOAD_BYTES;
+  let buffer: Buffer;
+  try {
+    buffer = await data.toBuffer();
+  } catch (error) {
+    if ((error as { code?: string }).code === "FST_REQ_FILE_TOO_LARGE") {
+      throw new AppError(
+        ErrorCode.UPLOAD_TOO_LARGE,
+        `Archive exceeds ${Math.floor(maxUploadBytes / 1024 / 1024)} MB limit`,
+      );
+    }
+    throw error;
+  }
+  if (buffer.byteLength > maxUploadBytes) {
+    throw new AppError(
+      ErrorCode.UPLOAD_TOO_LARGE,
+      `Archive exceeds ${Math.floor(maxUploadBytes / 1024 / 1024)} MB limit`,
+    );
   }
   const isZip =
     data.mimetype === "application/zip" ||
@@ -177,14 +191,19 @@ async function handleZipDeploy(
         : undefined,
   };
 
-  const result = await createDeployment({
-    websiteId,
-    userId,
-    source: "ZIP",
-    artifactKey: key,
-    zipConfig,
-  });
-  return ok(reply, result, 202);
+  try {
+    const result = await createDeployment({
+      websiteId,
+      userId,
+      source: "ZIP",
+      artifactKey: key,
+      zipConfig,
+    });
+    return ok(reply, result, 202);
+  } catch (error) {
+    await getStorage().deleteArtifact(key).catch(() => {});
+    throw error;
+  }
 }
 
 function serializeDeployment(d: {

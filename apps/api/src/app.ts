@@ -24,7 +24,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   const config = loadConfig();
   const app = Fastify({
     trustProxy: true,
-    bodyLimit: 1024 * 1024 * 60,
+    bodyLimit: config.MAX_UPLOAD_BYTES + 10 * 1024 * 1024,
   });
 
   await app.register(helmet, {
@@ -51,7 +51,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     timeWindow: "1 minute",
   });
   await app.register(multipart, {
-    limits: { fileSize: 50 * 1024 * 1024, files: 1 },
+    limits: { fileSize: config.MAX_UPLOAD_BYTES, files: 1 },
   });
 
   app.setErrorHandler((error, _request, reply) => {

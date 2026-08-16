@@ -1,0 +1,10 @@
+# Tunnel process can run on the PVE host or a dedicated small CT. Replace IPs.
+tunnel: CHANGE_ME_BABASTI_TUNNEL_UUID
+credentials-file: /etc/cloudflared/CHANGE_ME_BABASTI_TUNNEL_UUID.json
+
+ingress:
+  - hostname: agent2.babasti.my.id
+    service: http://10.20.20.111:4000
+  - hostname: "*.babasti.my.id"
+    service: http://10.20.20.111:80
+  - service: http_status:404

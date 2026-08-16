@@ -115,15 +115,16 @@ per-status website counts.
 
 > **Note:** these routes are mounted at `/internal/*` — **not** `/api/internal/*`.
 
-Every `/internal/*` endpoint is token-guarded by `NODE_AGENT_TOKEN`
-(`Authorization: Bearer <token>`). A missing or invalid token is rejected with
-**403 Forbidden** (this is what the agent must also enforce on its own `/v1/*`
-endpoints).
+`POST /nodes` is guarded by `NODE_REGISTRATION_TOKEN`. Other internal endpoints
+accept a registered node's unique `NODE_AGENT_TOKEN`. A missing, wrong, or
+cross-node heartbeat token is rejected with **403 Forbidden**; agents enforce
+their own token on every `/v1/*` endpoint as well.
 
 | Method | Path                                | Notes                                            |
 | ------ | ----------------------------------- | ------------------------------------------------ |
 | GET    | `/health`                           | control-plane health (token required)            |
 | POST   | `/nodes`                            | agent self-registers (`name`, `baseUrl`, …)      |
+| POST   | `/nodes/:id/heartbeat`              | refresh node liveness and capabilities            |
 | GET    | `/artifacts/*`                      | agent downloads a deployment artifact by key     |
 | POST   | `/deployments/:id/status`           | agent reports deploy/rollback status + logs      |
 | POST   | `/deployments/:id/log`              | agent streams a single deployment log line       |

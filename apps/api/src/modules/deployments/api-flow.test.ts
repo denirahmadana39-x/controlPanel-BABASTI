@@ -57,6 +57,13 @@ test("end-to-end website lifecycle via the API", async () => {
   assert.equal(dep.statusCode, 202, dep.body);
   const deploymentId = (JSON.parse(dep.body).data as { id: string }).id;
 
+  const placement = await prisma.deployment.findUniqueOrThrow({
+    where: { id: deploymentId },
+    select: { nodeId: true, website: { select: { nodeId: true } } },
+  });
+  assert.equal(placement.nodeId, "mock-node");
+  assert.equal(placement.website.nodeId, "mock-node");
+
   await runDeploy(deploymentId);
 
   // Deployment detail reflects success.

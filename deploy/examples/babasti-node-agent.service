@@ -1,0 +1,27 @@
+[Unit]
+Description=BabaSTI Hosting Node Agent
+After=network-online.target nginx.service
+Wants=network-online.target
+Requires=nginx.service
+
+[Service]
+Type=simple
+User=babasti-agent
+Group=www-data
+WorkingDirectory=/opt/babasti/current
+EnvironmentFile=/etc/babasti/node-agent.env
+ExecStart=/usr/bin/node services/node-agent/dist/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/babasti-agent /etc/nginx/babasti-sites.d
+# nginx -s reload signals the root-owned nginx master. Do not grant other caps.
+AmbientCapabilities=CAP_KILL
+CapabilityBoundingSet=CAP_KILL
+
+[Install]
+WantedBy=multi-user.target

@@ -44,6 +44,14 @@ test("nested artifact keys are supported (e.g. deployments/zip_123.zip)", async 
   );
 });
 
+test("deleteArtifact removes a staged upload and is idempotent", async () => {
+  const key = "deployments/remove-me.zip";
+  await storage.saveArtifact(key, Buffer.from("temporary"));
+  await storage.deleteArtifact(key);
+  assert.equal(await storage.exists(key), false);
+  await storage.deleteArtifact(key);
+});
+
 test("path traversal keys are rejected", async () => {
   await assert.rejects(
     () => storage.readArtifact("../escape.txt"),

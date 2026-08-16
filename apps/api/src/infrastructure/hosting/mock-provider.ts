@@ -244,7 +244,7 @@ export class MockHostingNodeProvider implements HostingProvider {
   async deleteWebsite(ctx: {
     websiteId: string;
     slug: string;
-    nodeId?: string | null;
+    node?: import("./types.js").HostingNode | null;
   }): Promise<void> {
     await fs.rm(siteRoot(ctx.slug), { recursive: true, force: true });
     logger.info(`[mock] removed site ${ctx.slug}`);
@@ -253,6 +253,7 @@ export class MockHostingNodeProvider implements HostingProvider {
   async getWebsiteStatus(_ctx: {
     websiteId: string;
     slug: string;
+    node?: import("./types.js").HostingNode | null;
   }): Promise<WebsiteStatus> {
     const root = siteRoot(_ctx.slug);
     const link = currentLink(_ctx.slug);
@@ -266,6 +267,7 @@ export class MockHostingNodeProvider implements HostingProvider {
   async getUsage(_ctx: {
     websiteId: string;
     slug: string;
+    node?: import("./types.js").HostingNode | null;
   }): Promise<WebsiteUsage> {
     // Best-effort disk usage estimate.
     const root = siteRoot(_ctx.slug);

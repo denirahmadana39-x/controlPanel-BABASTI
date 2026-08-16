@@ -1,0 +1,14 @@
+# Existing tunnel on CT 121. Replace the tunnel id/credential path and private IPs.
+tunnel: CHANGE_ME_MINIPC_TUNNEL_UUID
+credentials-file: /etc/cloudflared/CHANGE_ME_MINIPC_TUNNEL_UUID.json
+
+ingress:
+  - hostname: panel.babasti.my.id
+    service: http://10.30.30.122:80
+  - hostname: api.babasti.my.id
+    service: http://10.30.30.122:80
+  - hostname: agent3.babasti.my.id
+    service: http://10.30.30.124:4000
+  - hostname: "*.babasti.my.id"
+    service: http://10.30.30.124:80
+  - service: http_status:404

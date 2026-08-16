@@ -1,15 +1,20 @@
 import type { FastifyInstance } from "fastify";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../../infrastructure/database/prisma.js";
 import { loadConfig } from "@babasti/config";
 import { authenticate } from "../../plugins/auth.js";
 import { getHostingProvider } from "../../infrastructure/hosting/index.js";
-import { assertNodeAvailable } from "../../infrastructure/hosting/scheduler.js";
-import { AppError, ErrorCode, generateSlugSuggestion, logger } from "@babasti/shared";
+import {
+  assertNodeAvailable,
+  requireNodeById,
+} from "../../infrastructure/hosting/scheduler.js";
+import { AppError, ErrorCode, generateSlugSuggestion } from "@babasti/shared";
 import {
   createWebsiteSchema,
   updateWebsiteSchema,
 } from "@babasti/validation";
 import { ok } from "../../shared/http.js";
+import { getDnsProvider } from "../../infrastructure/dns/cloudflare.js";
 
 export async function registerWebsiteRoutes(
   app: FastifyInstance,
@@ -53,6 +58,15 @@ export async function registerWebsiteRoutes(
 
   app.post("/", { preHandler: authenticate }, async (request, reply) => {
     const input = createWebsiteSchema.parse(request.body);
+    const websiteCount = await prisma.website.count({
+      where: { userId: request.user!.id },
+    });
+    if (websiteCount >= config.MAX_WEBSITES_PER_USER) {
+      throw new AppError(
+        ErrorCode.QUOTA_EXCEEDED,
+        `Your plan allows ${config.MAX_WEBSITES_PER_USER} websites`,
+      );
+    }
     const slug = input.slug;
     const defaultDomain = `${slug}.${config.DEFAULT_DOMAIN_SUFFIX}`;
     const existing = await prisma.website.findFirst({
@@ -64,38 +78,78 @@ export async function registerWebsiteRoutes(
         "This name is already taken",
       );
     }
-    const website = await prisma.website.create({
-      data: {
-        userId: request.user!.id,
-        name: input.name,
-        slug,
-        description: input.description ?? "",
-        defaultDomain,
-      },
-    });
-    // Ensure the default domain record exists.
-    await prisma.domain.upsert({
-      where: { domain: defaultDomain },
-      create: {
-        websiteId: website.id,
-        domain: defaultDomain,
-        isDefault: true,
-        status: "ACTIVE",
-        verifiedAt: new Date(),
-      },
-      update: { isDefault: true },
-    });
+    let website;
     try {
-      const node = await assertNodeAvailable(getHostingProvider().name);
-      await getHostingProvider().createWebsite({
+      // The website and its default domain are one ownership unit. Nested
+      // creation prevents a concurrent request or pre-existing custom domain
+      // from leaving a website attached to somebody else's DNS name.
+      website = await prisma.website.create({
+        data: {
+          userId: request.user!.id,
+          name: input.name,
+          slug,
+          description: input.description ?? "",
+          defaultDomain,
+          domains: {
+            create: {
+              domain: defaultDomain,
+              isDefault: true,
+              status: "ACTIVE",
+              verifiedAt: new Date(),
+            },
+          },
+        },
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        throw new AppError(
+          ErrorCode.DOMAIN_TAKEN,
+          "This website name or default domain is already taken",
+        );
+      }
+      throw error;
+    }
+    const provider = getHostingProvider();
+    let node: Awaited<ReturnType<typeof assertNodeAvailable>> | null = null;
+    let provisioned = false;
+    let dnsRecordId: string | null = null;
+    try {
+      node = await assertNodeAvailable(provider.name);
+      const result = await provider.createWebsite({
         websiteId: website.id,
         slug: website.slug,
         defaultDomain: website.defaultDomain,
         customDomains: [],
         node,
       });
+      provisioned = true;
+      if (provider.name === "real") {
+        dnsRecordId = await getDnsProvider().ensureWebsiteRecord(
+          website.defaultDomain,
+          node.dnsTarget,
+        );
+      }
+      if (dnsRecordId) {
+        await prisma.domain.update({
+          where: { domain: defaultDomain },
+          data: { providerRecordId: dnsRecordId },
+        });
+      }
+      await prisma.website.update({
+        where: { id: website.id },
+        data: { nodeId: result.nodeId ?? node.id },
+      });
     } catch (error) {
-      logger.warn("Website node provisioning skipped", error);
+      if (dnsRecordId) {
+        await getDnsProvider().deleteRecord(dnsRecordId).catch(() => {});
+      }
+      if (provisioned && node) {
+        await provider
+          .deleteWebsite({ websiteId: website.id, slug: website.slug, node })
+          .catch(() => {});
+      }
+      await prisma.website.delete({ where: { id: website.id } }).catch(() => {});
+      throw error;
     }
     const full = await prisma.website.findUnique({
       where: { id: website.id },
@@ -154,14 +208,18 @@ export async function registerWebsiteRoutes(
   app.delete("/:websiteId", { preHandler: authenticate }, async (request, reply) => {
     const { websiteId } = request.params as { websiteId: string };
     const website = await ownWebsite(websiteId, request.user!.id);
-    try {
-      await getHostingProvider().deleteWebsite({
-        websiteId: website.id,
-        slug: website.slug,
-      });
-    } catch (error) {
-      logger.warn("Node cleanup failed", error);
-    }
+    const defaultDomain = await prisma.domain.findFirst({
+      where: { websiteId, isDefault: true },
+      select: { providerRecordId: true },
+    });
+    const provider = getHostingProvider();
+    const node = await requireNodeById(provider.name, website.nodeId);
+    await provider.deleteWebsite({
+      websiteId: website.id,
+      slug: website.slug,
+      node,
+    });
+    await getDnsProvider().deleteRecord(defaultDomain?.providerRecordId);
     await prisma.website.delete({ where: { id: websiteId } });
     return ok(reply, { success: true });
   });

@@ -80,27 +80,92 @@ async function buildAgent(): Promise<FastifyInstance> {
   return app;
 }
 
-async function registerWithControlPlane(): Promise<void> {
+interface RegisteredNode {
+  id: string;
+  heartbeatIntervalSeconds: number;
+}
+
+function nodeCapabilities() {
+  return {
+    sources: ["ZIP"],
+    staticHosting: true,
+    platform: process.platform,
+    architecture: process.arch,
+  };
+}
+
+function controlPlaneHeaders(token: string): Record<string, string> {
+  const config = loadConfig();
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    authorization: `Bearer ${token}`,
+  };
+  if (
+    config.CLOUDFLARE_ACCESS_CLIENT_ID &&
+    config.CLOUDFLARE_ACCESS_CLIENT_SECRET
+  ) {
+    headers["CF-Access-Client-Id"] = config.CLOUDFLARE_ACCESS_CLIENT_ID;
+    headers["CF-Access-Client-Secret"] =
+      config.CLOUDFLARE_ACCESS_CLIENT_SECRET;
+  }
+  return headers;
+}
+
+async function registerWithControlPlane(): Promise<RegisteredNode | null> {
   const controlPlane = (process.env.CONTROL_PLANE_URL || "http://localhost:3000").replace(/\/$/, "");
-  const token = loadConfig().NODE_AGENT_TOKEN;
-  if (!token) return;
+  const config = loadConfig();
+  const token = config.NODE_AGENT_TOKEN;
+  const registrationToken = config.nodeRegistrationToken;
+  if (!token || !registrationToken) return null;
   try {
     const res = await fetch(`${controlPlane}/internal/nodes`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${token}`,
-      },
+      headers: controlPlaneHeaders(registrationToken),
       body: JSON.stringify({
         name: process.env.NODE_NAME || "proxmox-node-1",
         baseUrl: process.env.PUBLIC_AGENT_URL || "",
+        dnsTarget: process.env.CLOUDFLARE_TUNNEL_TARGET || "",
+        token,
+        capabilities: nodeCapabilities(),
       }),
+      signal: AbortSignal.timeout(10_000),
     });
-    if (res.ok) logger.info("Registered node with control plane");
-    else logger.warn(`Node registration returned ${res.status}`);
+    if (res.ok) {
+      const data = (await res.json()) as RegisteredNode;
+      logger.info(`Registered node ${data.id} with control plane`);
+      return data;
+    }
+    logger.warn(`Node registration returned ${res.status}`);
   } catch (error) {
     logger.warn("Could not register with control plane", error);
   }
+  return null;
+}
+
+function startHeartbeat(node: RegisteredNode): NodeJS.Timeout {
+  const config = loadConfig();
+  const controlPlane = (config.CONTROL_PLANE_URL || "http://localhost:3000").replace(/\/$/, "");
+  const intervalSeconds = Math.max(
+    5,
+    node.heartbeatIntervalSeconds || config.NODE_HEARTBEAT_INTERVAL_SECONDS,
+  );
+  const heartbeat = async () => {
+    try {
+      const res = await fetch(
+        `${controlPlane}/internal/nodes/${encodeURIComponent(node.id)}/heartbeat`,
+        {
+          method: "POST",
+          headers: controlPlaneHeaders(config.NODE_AGENT_TOKEN),
+          body: JSON.stringify({ capabilities: nodeCapabilities() }),
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+      if (!res.ok) logger.warn(`Node heartbeat returned ${res.status}`);
+    } catch (error) {
+      logger.warn("Node heartbeat failed", error);
+    }
+  };
+  return setInterval(() => void heartbeat(), intervalSeconds * 1000);
 }
 
 async function main(): Promise<void> {
@@ -109,9 +174,38 @@ async function main(): Promise<void> {
   const port = Number(process.env.AGENT_PORT || 4000);
   await app.listen({ port, host: config.API_HOST });
   logger.info(`BabaSTI Node Agent listening on :${port}`);
+  let heartbeat: NodeJS.Timeout | undefined;
+  let registrationRefresh: NodeJS.Timeout | undefined;
+  let registeredNodeId: string | undefined;
+  let registrationInFlight = false;
   if (config.DEPLOYMENT_PROVIDER === "real") {
-    await registerWithControlPlane();
+    const refreshRegistration = async () => {
+      if (registrationInFlight) return;
+      registrationInFlight = true;
+      try {
+        const node = await registerWithControlPlane();
+        if (node && node.id !== registeredNodeId) {
+          if (heartbeat) clearInterval(heartbeat);
+          heartbeat = startHeartbeat(node);
+          registeredNodeId = node.id;
+        }
+      } finally {
+        registrationInFlight = false;
+      }
+    };
+    await refreshRegistration();
+    registrationRefresh = setInterval(
+      () => void refreshRegistration(),
+      60_000,
+    );
   }
+  const shutdown = async () => {
+    if (heartbeat) clearInterval(heartbeat);
+    if (registrationRefresh) clearInterval(registrationRefresh);
+    await app.close();
+  };
+  process.once("SIGTERM", () => void shutdown());
+  process.once("SIGINT", () => void shutdown());
 }
 
 main().catch((error) => {

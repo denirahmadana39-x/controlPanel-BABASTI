@@ -85,8 +85,9 @@ non-trivial, `*.service.ts`. Modules: `auth`, `websites`, `deployments`,
    release exists) keeps the site serving the previous release.
 6. `POST .../rollback` re-points the symlink to an earlier release.
 
-GitHub deployments reuse the same pipeline after fetching the repo tarball from
-`codeload.github.com` for the chosen ref.
+The GitHub API and client integration are scaffolded, but real-provider GitHub
+deployments remain disabled until clone/build execution is isolated in a
+resource-limited container. The public MVP accepts pre-built static ZIP files.
 
 ## Zero-downtime releases (Node Agent)
 
@@ -99,11 +100,25 @@ uninterrupted. Rollback is the same swap in reverse.
 
 ## Multi-node
 
-`DEPLOYMENT_PROVIDER=real` makes the scheduler pick a healthy node (heartbeats +
-capacity) and the real provider call the agent's REST API with
-`NODE_AGENT_TOKEN`. Nodes self-register via `POST /internal/nodes` (no `/api`
-prefix) and report results back through the internal callbacks, which the
-control plane uses to finalize deployments asynchronously.
+`DEPLOYMENT_PROVIDER=real` makes the scheduler pick a fresh healthy node using
+heartbeat TTL and assigned-website count. The selected node's encrypted
+`baseUrl` and unique token are used for every create/deploy/status/usage/delete
+operation. `Website.nodeId` is stable placement; `Deployment.nodeId` is its
+immutable execution snapshot. Nodes self-register with the separate
+`NODE_REGISTRATION_TOKEN`, then heartbeat with their individual
+`NODE_AGENT_TOKEN`. A draining node keeps existing sites but receives no new
+placements.
+
+## Public hostname routing
+
+Each node advertises its own `<tunnel-uuid>.cfargotunnel.com` DNS target during
+registration. After node placement, the control plane creates or updates a
+proxied CNAME for `<slug>.<DEFAULT_DOMAIN_SUFFIX>` pointing to that exact
+tunnel and stores the provider record id for cleanup. Therefore Cloudflare
+routes the hostname to the same node that owns the website releases; no public
+Proxmox or nginx port is required. Production real-provider mode fails website
+creation when the node target or zone-scoped Cloudflare DNS credentials are
+missing.
 
 ## Security model
 

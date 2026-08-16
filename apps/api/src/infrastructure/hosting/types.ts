@@ -18,6 +18,10 @@ export interface HostingNode {
   id: string;
   name: string;
   status: NodeStatus;
+  /** Agent endpoint and credential are server-only scheduling metadata. */
+  baseUrl?: string | null;
+  token?: string | null;
+  dnsTarget?: string | null;
 }
 
 export interface CreateWebsiteContext {
@@ -89,11 +93,16 @@ export interface HostingProvider {
   deleteWebsite(ctx: {
     websiteId: string;
     slug: string;
-    nodeId?: string | null;
+    node?: HostingNode | null;
   }): Promise<void>;
   getWebsiteStatus(ctx: {
     websiteId: string;
     slug: string;
+    node?: HostingNode | null;
   }): Promise<WebsiteStatus>;
-  getUsage(ctx: { websiteId: string; slug: string }): Promise<WebsiteUsage>;
+  getUsage(ctx: {
+    websiteId: string;
+    slug: string;
+    node?: HostingNode | null;
+  }): Promise<WebsiteUsage>;
 }

@@ -48,6 +48,8 @@ export interface JobState {
 }
 
 const STEP_DELAY_MS = process.env.NODE_ENV === "test" ? 0 : 300;
+const MAX_ARCHIVE_ENTRIES = 10_000;
+const SAFE_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 function delay(ms: number): Promise<void> {
   if (ms <= 0) return Promise.resolve();
@@ -57,14 +59,28 @@ function delay(ms: number): Promise<void> {
 export class NodeExecutor {
   private jobs = new Map<string, JobState>();
   private root: string;
+  private nginxConfigDir: string;
+  private nginxBinary: string;
+  private requireSystemNginx: boolean;
 
   constructor() {
     const config = loadConfig();
     this.root = path.resolve(config.agentStoragePath, "sites");
+    this.nginxConfigDir = config.AGENT_NGINX_CONFIG_DIR
+      ? path.resolve(config.AGENT_NGINX_CONFIG_DIR)
+      : "";
+    this.nginxBinary = config.AGENT_NGINX_BINARY;
+    this.requireSystemNginx =
+      config.NODE_ENV === "production" && config.DEPLOYMENT_PROVIDER === "real";
   }
 
   private siteRoot(slug: string): string {
-    return path.join(this.root, slug);
+    if (!SAFE_SLUG.test(slug)) throw new Error("invalid website slug");
+    const target = path.resolve(this.root, slug);
+    if (!target.startsWith(`${this.root}${path.sep}`)) {
+      throw new Error("website path escapes storage root");
+    }
+    return target;
   }
 
   private releaseDir(slug: string, num: number): string {
@@ -89,6 +105,13 @@ export class NodeExecutor {
     slug: string;
   }): Promise<void> {
     await fs.rm(this.siteRoot(input.slug), { recursive: true, force: true });
+    if (this.nginxConfigDir) {
+      await fs.rm(this.systemNginxConfig(input.slug), { force: true });
+      if (!(await validateSystemNginx(this.nginxBinary))) {
+        throw new Error("nginx validation failed after website removal");
+      }
+      await reloadSystemNginx(this.nginxBinary);
+    }
   }
 
   getStatus(slug: string): WebsiteStatus {
@@ -149,6 +172,24 @@ export class NodeExecutor {
     const slug = input.slug;
     const root = this.siteRoot(slug);
     try {
+      if (input.source !== "ZIP") {
+        log("ERROR", "GitHub deployments require the sandboxed build runner");
+        setStatus(DeploymentStatus.FAILED);
+        state.result = {
+          success: false,
+          message: "GitHub deployments are not enabled on this node",
+        };
+        return;
+      }
+      if (input.build.buildCommand || input.build.installCommand) {
+        log("ERROR", "Server-side build commands require the sandboxed build runner");
+        setStatus(DeploymentStatus.FAILED);
+        state.result = {
+          success: false,
+          message: "server-side builds are not enabled on this node",
+        };
+        return;
+      }
       await fs.mkdir(root, { recursive: true });
       const releasesPath = path.join(root, "releases");
       await fs.mkdir(releasesPath, { recursive: true });
@@ -172,7 +213,7 @@ export class NodeExecutor {
           return;
         }
         const res = await fetch(input.artifactDownloadUrl, {
-          headers: { authorization: `Bearer ${input.nodeToken}` },
+          headers: artifactDownloadHeaders(input.nodeToken),
           signal: AbortSignal.timeout(30_000),
         });
         if (!res.ok) {
@@ -190,26 +231,16 @@ export class NodeExecutor {
         log("INFO", "Extracting files");
         await extractZipSafe(staging, target);
         await fs.rm(staging, { force: true });
-      } else {
-        setStatus(DeploymentStatus.CLONING);
-        log("INFO", `Cloning ${input.gitRepo?.name ?? "repo"}`);
-        await delay(STEP_DELAY_MS * 2);
-      }
-
-      if (input.build.buildCommand) {
-        setStatus(DeploymentStatus.INSTALLING);
-        log("INFO", `Running: ${input.build.installCommand ?? "npm install"}`);
-        await delay(STEP_DELAY_MS);
-        setStatus(DeploymentStatus.BUILDING);
-        log("INFO", `Running: ${input.build.buildCommand}`);
-        await delay(STEP_DELAY_MS);
       }
 
       const entries = await fs.readdir(target).catch(() => [] as string[]);
       if (!entries.includes("index.html")) {
         const out = input.build.outputDirectory;
         if (out) {
-          const built = path.join(target, out);
+          const built = path.resolve(target, out);
+          if (!built.startsWith(`${path.resolve(target)}${path.sep}`)) {
+            throw new Error("publish directory escapes release root");
+          }
           const builtEntries = await fs
             .readdir(built)
             .catch(() => [] as string[]);
@@ -218,11 +249,13 @@ export class NodeExecutor {
           }
         }
         if (!(await fs.readdir(target).catch(() => [] as string[])).includes("index.html")) {
-          await fs.writeFile(
-            path.join(target, "index.html"),
-            `<!doctype html><html><body><h1>${slug}.babasti.my.id</h1><p>Live on BabaSTI Hosting.</p></body></html>`,
-          );
-          log("WARN", "No index.html; served a generated placeholder");
+          log("ERROR", "No index.html found in the publish directory");
+          setStatus(DeploymentStatus.FAILED);
+          state.result = {
+            success: false,
+            message: "publish directory must contain index.html",
+          };
+          return;
         }
       } else {
         log("INFO", "Build output validated");
@@ -233,9 +266,7 @@ export class NodeExecutor {
       await delay(STEP_DELAY_MS);
 
       setStatus(DeploymentStatus.CONFIGURING);
-      const ngx = buildNginx(input.domains, target);
-      await fs.writeFile(path.join(root, "nginx.conf"), ngx);
-      const valid = await validateNginx(path.join(root, "nginx.conf"));
+      const valid = await this.installRouting(slug, input.domains);
       if (!valid) {
         log("ERROR", "Nginx config validation failed");
         setStatus(DeploymentStatus.FAILED);
@@ -252,7 +283,17 @@ export class NodeExecutor {
         return;
       }
 
-      await createSymlink(target, this.currentLink(slug));
+      const liveLink = this.currentLink(slug);
+      const previousTarget = await fs.readlink(liveLink).catch(() => null);
+      await createSymlink(target, liveLink);
+      if (!(await this.healthCheck(input.domains[0], target))) {
+        if (previousTarget) await createSymlink(previousTarget, liveLink);
+        else await fs.rm(liveLink, { force: true });
+        log("ERROR", "Published website did not pass its live health check");
+        setStatus(DeploymentStatus.FAILED);
+        state.result = { success: false, message: "live health check failed" };
+        return;
+      }
       log("INFO", "Deployment successful");
       setStatus(DeploymentStatus.SUCCESS);
       state.result = {
@@ -275,17 +316,86 @@ export class NodeExecutor {
     releaseNumber: number;
   }): Promise<{ success: boolean; message?: string }> {
     const root = this.siteRoot(input.slug);
-    const target = path.join(root, input.releasePath);
+    const target = path.resolve(root, input.releasePath);
+    const expected = path.resolve(this.releaseDir(input.slug, input.releaseNumber));
+    if (target !== expected) {
+      return { success: false, message: "invalid release path" };
+    }
     try {
       await fs.access(target);
-      const ngx = buildNginx(input.domains, target);
-      await fs.writeFile(path.join(root, "nginx.conf"), ngx);
-      const valid = await validateNginx(path.join(root, "nginx.conf"));
+      const valid = await this.installRouting(input.slug, input.domains);
       if (!valid) return { success: false, message: "nginx invalid" };
-      await createSymlink(target, this.currentLink(input.slug));
+      const liveLink = this.currentLink(input.slug);
+      const previousTarget = await fs.readlink(liveLink).catch(() => null);
+      await createSymlink(target, liveLink);
+      if (!(await this.healthCheck(input.domains[0], target))) {
+        if (previousTarget) await createSymlink(previousTarget, liveLink);
+        else await fs.rm(liveLink, { force: true });
+        return { success: false, message: "live health check failed" };
+      }
       return { success: true };
     } catch (error) {
       return { success: false, message: (error as Error).message };
+    }
+  }
+
+  private systemNginxConfig(slug: string): string {
+    return path.join(this.nginxConfigDir, `babasti-${slug}.conf`);
+  }
+
+  private async installRouting(slug: string, domains: string[]): Promise<boolean> {
+    const root = this.siteRoot(slug);
+    const configPath = path.join(root, "nginx.conf");
+    const nginx = buildNginx(domains, this.currentLink(slug));
+    await fs.writeFile(configPath, nginx);
+    if (!(await validateNginx(configPath))) return false;
+
+    if (!this.nginxConfigDir) {
+      if (this.requireSystemNginx) {
+        logger.error("AGENT_NGINX_CONFIG_DIR is required in production real mode");
+        return false;
+      }
+      logger.warn("System nginx publishing disabled (development mode)");
+      return true;
+    }
+
+    await fs.mkdir(this.nginxConfigDir, { recursive: true });
+    const destination = this.systemNginxConfig(slug);
+    const temporary = `${destination}.tmp-${process.pid}-${Date.now()}`;
+    const previous = await fs.readFile(destination).catch(() => null);
+    await fs.writeFile(temporary, nginx, { flag: "wx" });
+    await fs.rename(temporary, destination);
+
+    if (!(await validateSystemNginx(this.nginxBinary))) {
+      if (previous) await fs.writeFile(destination, previous);
+      else await fs.rm(destination, { force: true });
+      return false;
+    }
+    try {
+      await reloadSystemNginx(this.nginxBinary);
+      return true;
+    } catch (error) {
+      if (previous) await fs.writeFile(destination, previous);
+      else await fs.rm(destination, { force: true });
+      logger.error("nginx reload failed", error);
+      return false;
+    }
+  }
+
+  private async healthCheck(domain: string | undefined, target: string): Promise<boolean> {
+    if (!this.nginxConfigDir) {
+      return fs.readdir(target).then((entries) => entries.length > 0).catch(() => false);
+    }
+    if (!domain) return false;
+    try {
+      const response = await fetch("http://127.0.0.1/", {
+        headers: { host: domain },
+        redirect: "manual",
+        signal: AbortSignal.timeout(10_000),
+      });
+      return response.status >= 200 && response.status < 400;
+    } catch {
+      return false;
     }
   }
 }
@@ -323,11 +433,24 @@ async function extractZipSafe(zipPath: string, targetDir: string): Promise<void>
         resolve();
       });
       zipfile.readEntry();
+      let entries = 0;
+      let extractedBytes = 0;
       zipfile.on("entry", (entry: Entry) => {
+        entries += 1;
+        extractedBytes += entry.uncompressedSize;
+        if (
+          entries > MAX_ARCHIVE_ENTRIES ||
+          extractedBytes > loadConfig().MAX_EXTRACTED_BYTES
+        ) {
+          return onErr(new Error("archive extraction limit exceeded"));
+        }
         const name = normalizeEntryName(entry.fileName);
         if (!name) return onErr(new Error(`unsafe entry ${entry.fileName}`));
         const dest = path.join(resolvedTarget, name);
-        if (!dest.startsWith(resolvedTarget))
+        if (
+          dest !== resolvedTarget &&
+          !dest.startsWith(`${resolvedTarget}${path.sep}`)
+        )
           return onErr(new Error("entry escapes target"));
         if (entry.fileName.endsWith("/")) {
           fs.mkdir(dest, { recursive: true })
@@ -365,17 +488,28 @@ async function moveContents(from: string, to: string): Promise<void> {
 }
 
 async function createSymlink(target: string, link: string): Promise<void> {
-  try {
-    await fs.unlink(link);
-  } catch {
-    /* noop */
-  }
   // On Windows, directory symlinks require elevated privileges whereas a
   // junction does not, so use a junction there. On other platforms the
   // directory symlink type is correct.
   const type: "dir" | "junction" =
     process.platform === "win32" ? "junction" : "dir";
-  await fs.symlink(target, link, type);
+  const temporary = `${link}.tmp-${process.pid}-${Date.now()}`;
+  await fs.rm(temporary, { recursive: true, force: true });
+  await fs.symlink(target, temporary, type);
+  try {
+    // POSIX rename replaces the old symlink atomically, so nginx never sees a
+    // missing `current` path.
+    await fs.rename(temporary, link);
+  } catch (error) {
+    if (process.platform !== "win32") {
+      await fs.rm(temporary, { recursive: true, force: true });
+      throw error;
+    }
+    // Windows cannot replace an existing junction with rename. This fallback
+    // is used by local verification only; production nodes are Linux.
+    await fs.rm(link, { recursive: true, force: true });
+    await fs.rename(temporary, link);
+  }
 }
 
 function escapeNginx(value: string): string {
@@ -459,4 +593,38 @@ async function validateNginx(configPath: string): Promise<boolean> {
       }
     }
   }
+}
+
+async function validateSystemNginx(binary: string): Promise<boolean> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  try {
+    await promisify(execFile)(binary, ["-t"]);
+    return true;
+  } catch (error) {
+    logger.error("system nginx validation failed", error);
+    return false;
+  }
+}
+
+async function reloadSystemNginx(binary: string): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  await promisify(execFile)(binary, ["-s", "reload"]);
+}
+
+function artifactDownloadHeaders(nodeToken: string): Record<string, string> {
+  const config = loadConfig();
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${nodeToken}`,
+  };
+  if (
+    config.CLOUDFLARE_ACCESS_CLIENT_ID &&
+    config.CLOUDFLARE_ACCESS_CLIENT_SECRET
+  ) {
+    headers["CF-Access-Client-Id"] = config.CLOUDFLARE_ACCESS_CLIENT_ID;
+    headers["CF-Access-Client-Secret"] =
+      config.CLOUDFLARE_ACCESS_CLIENT_SECRET;
+  }
+  return headers;
 }

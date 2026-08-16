@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b",
-    "test": "npm run test -w apps/api",
+    "test": "npm run test -w apps/api && npm run test -w services/node-agent",
     "dev:api": "npm run dev -w apps/api",
     "dev:client": "npm run dev -w apps/client",
     "dev:agent": "npm run dev -w services/node-agent",

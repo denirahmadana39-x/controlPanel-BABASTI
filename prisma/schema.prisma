@@ -126,6 +126,9 @@ model Website {
   defaultDomain   String        @unique
   currentReleaseId String?
   lastDeploymentId String?
+  // Stable hosting placement. Existing releases remain on this node until an
+  // explicit migration workflow moves them.
+  nodeId           String?
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
@@ -138,6 +141,7 @@ model Website {
   gitRepositories GitRepository[]
 
   @@index([userId])
+  @@index([nodeId])
 }
 
 model Domain {
@@ -147,6 +151,7 @@ model Domain {
   isDefault  Boolean      @default(false)
   status     DomainStatus @default(PENDING)
   verifiedAt DateTime?
+  providerRecordId String?
   createdAt  DateTime     @default(now())
   updatedAt  DateTime     @updatedAt
 
@@ -255,7 +260,8 @@ model HostingNodeReference {
   name          String           @unique
   status        HostingNodeStatus @default(OFFLINE)
   baseUrl       String?
-  token         String? // node registration token (never exposed to clients)
+  dnsTarget     String? // <tunnel-uuid>.cfargotunnel.com for per-site routing
+  token         String? // encrypted per-node Agent token (never exposed to clients)
   registeredAt  DateTime?
   lastHeartbeat DateTime?
   capabilities  String? // JSON, reserved for future scheduling

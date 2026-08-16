@@ -40,6 +40,12 @@ const configSchema = z.object({
 
   NODE_AGENT_URL: z.string().optional().default(""),
   NODE_AGENT_TOKEN: z.string().optional().default(""),
+  // Bootstrap credential used only for node registration. When omitted,
+  // NODE_AGENT_TOKEN remains supported for backwards-compatible single-node
+  // installations.
+  NODE_REGISTRATION_TOKEN: z.string().optional().default(""),
+  NODE_HEARTBEAT_INTERVAL_SECONDS: z.coerce.number().int().min(5).default(30),
+  NODE_HEARTBEAT_TTL_SECONDS: z.coerce.number().int().min(15).default(90),
 
   // URL the Node Agent uses to reach the control plane (for artifact download).
   CONTROL_PLANE_URL: z.string().optional().default(""),
@@ -47,15 +53,36 @@ const configSchema = z.object({
   STORAGE_PATH: z.string().default("./data/storage"),
   REDIS_URL: z.string().optional().default(""),
 
+  MAX_WEBSITES_PER_USER: z.coerce.number().int().min(1).default(3),
+  MAX_DEPLOYMENTS_PER_DAY: z.coerce.number().int().min(1).default(10),
+  MAX_CONCURRENT_DEPLOYMENTS_PER_USER: z.coerce.number().int().min(1).default(1),
+  MAX_UPLOAD_BYTES: z.coerce.number().int().min(1024).default(50 * 1024 * 1024),
+  MAX_EXTRACTED_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1024)
+    .default(250 * 1024 * 1024),
+
   // Optional separate storage root for the Node Agent. When unset the agent
   // falls back to STORAGE_PATH.
   AGENT_STORAGE: z.string().optional().default(""),
+  // Directory included by the node's main nginx configuration, typically
+  // /etc/nginx/conf.d. Production real-provider deployments require it.
+  AGENT_NGINX_CONFIG_DIR: z.string().optional().default(""),
+  AGENT_NGINX_BINARY: z.string().default("nginx"),
 
   DEFAULT_DOMAIN_SUFFIX: z.string().default("babasti.my.id"),
+
+  CLOUDFLARE_API_TOKEN: z.string().optional().default(""),
+  CLOUDFLARE_ZONE_ID: z.string().optional().default(""),
+  CLOUDFLARE_DNS_PROXIED: rawBoolean.default("true"),
+  CLOUDFLARE_ACCESS_CLIENT_ID: z.string().optional().default(""),
+  CLOUDFLARE_ACCESS_CLIENT_SECRET: z.string().optional().default(""),
 });
 
 export type AppConfig = z.infer<typeof configSchema> & {
   agentStoragePath: string;
+  nodeRegistrationToken: string;
 };
 
 let cached: AppConfig | null = null;
@@ -75,6 +102,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   cached = {
     ...data,
     agentStoragePath: data.AGENT_STORAGE || data.STORAGE_PATH,
+    nodeRegistrationToken:
+      data.NODE_REGISTRATION_TOKEN || data.NODE_AGENT_TOKEN,
   } as AppConfig;
   return cached;
 }

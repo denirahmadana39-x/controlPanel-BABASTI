@@ -43,31 +43,41 @@ interface AgentJobStatus {
 
 export class RealHostingNodeProvider implements HostingProvider {
   readonly name = "real";
-  private baseUrl: string;
-  private token: string;
 
-  constructor() {
-    const config = loadConfig();
-    const url = config.NODE_AGENT_URL;
-    if (!url) {
-      throw new Error("NODE_AGENT_URL is required for the real provider");
-    }
-    this.baseUrl = url.replace(/\/$/, "");
-    this.token = config.NODE_AGENT_TOKEN;
+  private connection(node: HostingNode | null | undefined): {
+    baseUrl: string;
+    token: string;
+  } {
+    if (!node) throw new Error("No hosting node available");
+    const baseUrl = node.baseUrl?.replace(/\/$/, "");
+    const token = node.token;
+    if (!baseUrl) throw new Error(`Hosting node ${node.name} has no base URL`);
+    if (!token) throw new Error(`Hosting node ${node.name} has no agent token`);
+    return { baseUrl, token };
   }
 
-  private headers(): Record<string, string> {
-    return {
+  private headers(token: string): Record<string, string> {
+    const config = loadConfig();
+    const headers: Record<string, string> = {
       "content-type": "application/json",
-      authorization: `Bearer ${this.token}`,
+      authorization: `Bearer ${token}`,
     };
+    if (
+      config.CLOUDFLARE_ACCESS_CLIENT_ID &&
+      config.CLOUDFLARE_ACCESS_CLIENT_SECRET
+    ) {
+      headers["CF-Access-Client-Id"] = config.CLOUDFLARE_ACCESS_CLIENT_ID;
+      headers["CF-Access-Client-Secret"] =
+        config.CLOUDFLARE_ACCESS_CLIENT_SECRET;
+    }
+    return headers;
   }
 
   async createWebsite(ctx: CreateWebsiteContext): Promise<{ nodeId?: string }> {
-    if (!ctx.node) throw new Error("No hosting node available");
-    const res = await fetch(`${this.baseUrl}/v1/websites`, {
+    const connection = this.connection(ctx.node);
+    const res = await fetch(`${connection.baseUrl}/v1/websites`, {
       method: "POST",
-      headers: this.headers(),
+      headers: this.headers(connection.token),
       body: JSON.stringify({
         websiteId: ctx.websiteId,
         slug: ctx.slug,
@@ -77,15 +87,14 @@ export class RealHostingNodeProvider implements HostingProvider {
     if (!res.ok) {
       throw new Error(`Node agent createWebsite failed: ${res.status}`);
     }
-    const data = (await res.json()) as { nodeId: string };
-    return { nodeId: data.nodeId ?? ctx.node.id };
+    return { nodeId: ctx.node!.id };
   }
 
   async deployWebsite(
     ctx: DeployContext,
     hooks: DeployHooks,
   ): Promise<DeployResult> {
-    if (!ctx.node) throw new Error("No hosting node available");
+    const connection = this.connection(ctx.node);
     const payload = {
       deploymentId: ctx.deploymentId,
       websiteId: ctx.websiteId,
@@ -96,13 +105,13 @@ export class RealHostingNodeProvider implements HostingProvider {
       artifactDownloadUrl: ctx.artifactKey
         ? `${this.controlPlaneUrl()}/internal/artifacts/${ctx.artifactKey}`
         : undefined,
-      nodeToken: this.token,
+      nodeToken: connection.token,
       gitRepo: ctx.gitRepo,
       build: ctx.build,
     };
-    const res = await fetch(`${this.baseUrl}/v1/deployments`, {
+    const res = await fetch(`${connection.baseUrl}/v1/deployments`, {
       method: "POST",
-      headers: this.headers(),
+      headers: this.headers(connection.token),
       body: JSON.stringify(payload),
       // Don't block forever if the node is unreachable/hung (spec §19).
       signal: AbortSignal.timeout(30_000),
@@ -112,12 +121,12 @@ export class RealHostingNodeProvider implements HostingProvider {
       await hooks.setStatus("FAILED");
       return { success: false, message: "agent rejected job" };
     }
-    return this.poll(ctx.deploymentId, ctx.node, hooks);
+    return this.poll(ctx.deploymentId, connection, hooks);
   }
 
   private async poll(
     deploymentId: string,
-    _node: HostingNode,
+    connection: { baseUrl: string; token: string },
     hooks: DeployHooks,
   ): Promise<DeployResult> {
     const deadline = Date.now() + 1000 * 60 * 15; // 15 min
@@ -128,8 +137,11 @@ export class RealHostingNodeProvider implements HostingProvider {
       let status: AgentJobStatus;
       try {
         const res = await fetch(
-          `${this.baseUrl}/v1/deployments/${deploymentId}`,
-          { headers: this.headers(), signal: AbortSignal.timeout(10_000) },
+          `${connection.baseUrl}/v1/deployments/${deploymentId}`,
+          {
+            headers: this.headers(connection.token),
+            signal: AbortSignal.timeout(10_000),
+          },
         );
         if (!res.ok) {
           logger.warn(`Agent status poll failed: ${res.status}`);
@@ -174,7 +186,7 @@ export class RealHostingNodeProvider implements HostingProvider {
   }
 
   private controlPlaneUrl(): string {
-    const url = process.env.CONTROL_PLANE_URL || "http://localhost:3000";
+    const url = loadConfig().CONTROL_PLANE_URL || "http://localhost:3000";
     return url.replace(/\/$/, "");
   }
 
@@ -182,10 +194,15 @@ export class RealHostingNodeProvider implements HostingProvider {
     ctx: RollbackContext,
     hooks: DeployHooks,
   ): Promise<RollbackResult> {
-    if (!ctx.node) return { success: false, message: "No hosting node" };
-    const res = await fetch(`${this.baseUrl}/v1/rollbacks`, {
+    let connection: { baseUrl: string; token: string };
+    try {
+      connection = this.connection(ctx.node);
+    } catch (error) {
+      return { success: false, message: (error as Error).message };
+    }
+    const res = await fetch(`${connection.baseUrl}/v1/rollbacks`, {
       method: "POST",
-      headers: this.headers(),
+      headers: this.headers(connection.token),
       body: JSON.stringify({
         websiteId: ctx.websiteId,
         slug: ctx.slug,
@@ -206,29 +223,33 @@ export class RealHostingNodeProvider implements HostingProvider {
   async deleteWebsite(ctx: {
     websiteId: string;
     slug: string;
-    nodeId?: string | null;
+    node?: HostingNode | null;
   }): Promise<void> {
+    const connection = this.connection(ctx.node);
     const res = await fetch(
-      `${this.createUrl()}/v1/websites/${ctx.websiteId}`,
-      { method: "DELETE", headers: this.headers(), signal: AbortSignal.timeout(30_000) },
+      `${connection.baseUrl}/v1/websites/${ctx.websiteId}`,
+      {
+        method: "DELETE",
+        headers: this.headers(connection.token),
+        body: JSON.stringify({ slug: ctx.slug }),
+        signal: AbortSignal.timeout(30_000),
+      },
     );
     if (!res.ok) {
       logger.warn(`Agent delete failed: ${res.status}`);
     }
   }
 
-  private createUrl(): string {
-    return this.baseUrl;
-  }
-
-  async getWebsiteStatus(_ctx: {
+  async getWebsiteStatus(ctx: {
     websiteId: string;
     slug: string;
+    node?: HostingNode | null;
   }): Promise<WebsiteStatus> {
     try {
+      const connection = this.connection(ctx.node);
       const res = await fetch(
-        `${this.baseUrl}/v1/websites/${_ctx.websiteId}/status`,
-        { headers: this.headers() },
+        `${connection.baseUrl}/v1/websites/${ctx.websiteId}/status?slug=${encodeURIComponent(ctx.slug)}`,
+        { headers: this.headers(connection.token) },
       );
       if (!res.ok) return "OFFLINE";
       const data = (await res.json()) as { status: WebsiteStatus };
@@ -238,14 +259,16 @@ export class RealHostingNodeProvider implements HostingProvider {
     }
   }
 
-  async getUsage(_ctx: {
+  async getUsage(ctx: {
     websiteId: string;
     slug: string;
+    node?: HostingNode | null;
   }): Promise<WebsiteUsage> {
     try {
+      const connection = this.connection(ctx.node);
       const res = await fetch(
-        `${this.baseUrl}/v1/websites/${_ctx.websiteId}/usage`,
-        { headers: this.headers() },
+        `${connection.baseUrl}/v1/websites/${ctx.websiteId}/usage?slug=${encodeURIComponent(ctx.slug)}`,
+        { headers: this.headers(connection.token) },
       );
       if (!res.ok) return { storageBytes: 0, bandwidthBytes: 0, deploymentsCount: 0 };
       return (await res.json()) as WebsiteUsage;

@@ -44,10 +44,12 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useToast } from "@/components/ui/toast";
 import { formatRelativeTime, formatBytes, maskSecret } from "@/lib/utils";
 import { ApiError } from "@/lib/api";
+import { DeployWebsiteModal } from "@/components/deployments/DeployWebsiteModal";
 
 export function WebsiteDetailPage() {
   const { id = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
+  const [deployOpen, setDeployOpen] = React.useState(false);
   const tab = searchParams.get("tab") ?? "overview";
   const setTab = (t: string) => setSearchParams({ tab: t });
 
@@ -93,11 +95,13 @@ export function WebsiteDetailPage() {
           </a>
         </div>
         <div className="flex gap-2">
-          <Link to={`/dashboard/websites/new`}>
-            <Button variant="outline" size="sm">
-              <Rocket className="h-4 w-4" /> New deploy
-            </Button>
-          </Link>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setDeployOpen(true)}
+          >
+            <Rocket className="h-4 w-4" /> New deploy
+          </Button>
           <a href={website.url} target="_blank" rel="noreferrer">
             <Button size="sm">
               <ExternalLink className="h-4 w-4" /> Open Website
@@ -120,11 +124,24 @@ export function WebsiteDetailPage() {
 
       <div className="pt-2">
         {tab === "overview" && <OverviewTab website={website} />}
-        {tab === "deployments" && <DeploymentsTab websiteId={website.id} />}
+        {tab === "deployments" && (
+          <DeploymentsTab
+            websiteId={website.id}
+            onDeploy={() => setDeployOpen(true)}
+          />
+        )}
         {tab === "domains" && <DomainsTab websiteId={website.id} />}
         {tab === "environment" && <EnvironmentTab websiteId={website.id} />}
         {tab === "settings" && <SettingsTab website={website} />}
       </div>
+      {deployOpen ? (
+        <DeployWebsiteModal
+          websiteId={website.id}
+          websiteName={website.name}
+          open
+          onClose={() => setDeployOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -177,7 +194,13 @@ function OverviewTab({ website }: { website: any }) {
   );
 }
 
-function DeploymentsTab({ websiteId }: { websiteId: string }) {
+function DeploymentsTab({
+  websiteId,
+  onDeploy,
+}: {
+  websiteId: string;
+  onDeploy: () => void;
+}) {
   const { data, isLoading } = useDeployments(websiteId);
   const [logsFor, setLogsFor] = React.useState<string | null>(null);
   const cancel = useCancelDeployment();
@@ -193,11 +216,9 @@ function DeploymentsTab({ websiteId }: { websiteId: string }) {
         <EmptyState
           icon={<Rocket className="h-10 w-10" />}
           title="No deployments yet"
-          description="Upload a ZIP or connect GitHub to ship your first release."
+          description="Upload a pre-built ZIP to publish your first release."
           action={
-            <Link to={`/dashboard/websites/new`}>
-              <Button>Deploy now</Button>
-            </Link>
+            <Button onClick={onDeploy}>Deploy now</Button>
           }
         />
       ) : (

@@ -23,9 +23,11 @@ deployment, rollback safety, and how to reproduce the end-to-end verification.
 | Rollback | ✅ | Re-points `current` to a prior release |
 | Failed-deploy safety | ✅ | A failed deploy never replaces a working release |
 | nginx validation | ✅ | `nginx -t` on a full temp config before any live change |
-| Agent auth | ✅ | `NODE_AGENT_TOKEN` bearer on every `/v1/*` and `/internal/*` call |
+| Agent auth | ✅ | Unique per-node bearer tokens; separate bootstrap token for registration |
+| Node liveness | ✅ | Periodic heartbeat; stale nodes automatically become `OFFLINE` |
+| Multi-node placement | ✅ | Website and deployment remain pinned to the node owning their releases |
 | Queue | ✅ | Redis-backed; in-memory fallback when `REDIS_URL` is empty |
-| Ops tooling | ⚠️ | No Dockerfile / systemd unit shipped (run via `node dist`) |
+| Ops tooling | ✅ | Example systemd, nginx, environment, and cloudflared files under `deploy/examples/` |
 | TLS | ⚠️ | Run behind a TLS-terminating reverse proxy (nginx/Caddy) |
 | Admin panel | ❌ | Not part of this MVP (client-only platform) |
 
@@ -50,38 +52,72 @@ $env:CLIENT_URL="https://app.example.com"
 $env:SESSION_SECRET="<long-random>"
 $env:COOKIE_SECURE="true"
 $env:DEPLOYMENT_PROVIDER="real"
-$env:NODE_AGENT_URL="http://node-agent:4000"
-$env:NODE_AGENT_TOKEN="<shared-secret>"
+$env:NODE_REGISTRATION_TOKEN="<registration-only-secret>"
+$env:NODE_HEARTBEAT_TTL_SECONDS="90"
+# Optional legacy fallback for a single node only:
+$env:NODE_AGENT_URL=""
+$env:NODE_AGENT_TOKEN=""
 $env:CONTROL_PLANE_URL="https://cp.example.com"
 $env:REDIS_URL="redis://redis:6379"
 $env:STORAGE_PATH="/var/lib/babasti/storage"
+$env:CLOUDFLARE_ZONE_ID="<babasti.my.id-zone-id>"
+$env:CLOUDFLARE_API_TOKEN="<zone-dns-write-token>"
+# Optional only when the private Agent hostname is behind Cloudflare Access:
+$env:CLOUDFLARE_ACCESS_CLIENT_ID="<service-token-client-id>"
+$env:CLOUDFLARE_ACCESS_CLIENT_SECRET="<service-token-secret>"
 
 npm run start -w apps/api
 ```
 
 ### 2.2 Hosting Node Agent
 
-Run one agent per hosting node. It must be reachable from the control plane at
-`NODE_AGENT_URL`, and it must be able to reach the control plane at
+Run one agent per hosting node. It advertises its own `PUBLIC_AGENT_URL` during
+registration, and it must be able to reach the control plane at
 `CONTROL_PLANE_URL` (to download artifacts and report status).
 
 ```powershell
 $env:NODE_ENV="production"
 $env:AGENT_PORT="4000"
 $env:NODE_NAME="proxmox-node-1"
-$env:PUBLIC_AGENT_URL="http://node-agent:4000"
-$env:NODE_AGENT_TOKEN="<same-shared-secret-as-control-plane>"
+$env:PUBLIC_AGENT_URL="https://agent2.internal.babasti.my.id"
+$env:NODE_AGENT_TOKEN="<unique-secret-for-this-node>"
+$env:NODE_REGISTRATION_TOKEN="<registration-only-secret>"
 $env:CONTROL_PLANE_URL="https://cp.example.com"
 $env:STORAGE_PATH="/var/lib/babasti-agent/storage"   # agent-managed releases live here
 # AGENT_STORAGE optional; defaults to STORAGE_PATH
 $env:AGENT_STORAGE="/var/lib/babasti-agent/storage"
+$env:AGENT_NGINX_CONFIG_DIR="/etc/nginx/conf.d"
+$env:AGENT_NGINX_BINARY="nginx"
+$env:CLOUDFLARE_TUNNEL_TARGET="<this-node-tunnel-uuid>.cfargotunnel.com"
+# Optional only when the control-plane internal route is behind Access:
+$env:CLOUDFLARE_ACCESS_CLIENT_ID="<service-token-client-id>"
+$env:CLOUDFLARE_ACCESS_CLIENT_SECRET="<service-token-secret>"
 
 npm run start -w services/node-agent
 ```
 
 On boot the agent self-registers with the control plane
-(`POST /internal/nodes`). The scheduler then considers it eligible for new
-websites.
+(`POST /internal/nodes`), stores its returned node id, and starts heartbeat
+requests. The scheduler considers only fresh `ONLINE` nodes for new websites.
+The agent service user must be able to write `AGENT_NGINX_CONFIG_DIR` and run
+`nginx -t` / `nginx -s reload`. Production real-provider mode refuses to mark a
+release online when this directory is not configured.
+
+Configure the same tunnel on each HostingNode with a wildcard ingress rule for
+`*.babasti.my.id` pointing to the node's local nginx. The control plane creates
+one proxied CNAME per website and points it at the tunnel target advertised by
+the selected node. Use a Cloudflare API token restricted to the
+`babasti.my.id` zone with DNS Write; do not use a Global API key.
+
+Do not put the public customer wildcard behind Cloudflare Access: deployed
+websites must remain publicly reachable. Access is appropriate for Proxmox and
+private Agent hostnames. When used, the service token id and secret are added to
+control-plane → Agent calls, Agent registration/heartbeat, and artifact
+downloads; the two values must always be configured as a pair.
+
+For the exact two-node BabaSTI topology, use
+[`PROXMOX-ROLLOUT.md`](PROXMOX-ROLLOUT.md) and the non-secret templates in
+`deploy/examples/`.
 
 ---
 
@@ -104,11 +140,11 @@ sequenceDiagram
   API->>A: POST /v1/deployments (artifact URL + token)
   A->>API: GET /internal/artifacts/:key (download)
   A->>A: extract → releases/<n>/ (immutable)
-  A->>A: validate nginx config (nginx -t on temp full config)
+  A->>A: validate nginx vhost + extraction limits
+  A->>N: atomically install vhost; nginx -t; reload
   A->>A: atomic swap current → releases/<n>
-  A->>N: reload nginx
-  A->>A: GET /health (site) → 200?
-  A->>API: POST /internal/deployments/:id/status (SUCCESS)
+  A->>N: GET / with site Host header → 2xx/3xx?
+  API->>A: poll deployment status/logs
   API->>API: finalize Release, Website.status = LIVE
 ```
 
@@ -119,8 +155,9 @@ Key properties:
 - **Atomic switch.** The live `current` symlink is swapped via `rename` only
   after the release is fully extracted and the nginx config passes
   validation. In-flight requests are uninterrupted.
-- **Verified before serving.** The agent performs a local health check of the
-  deployed site; the control plane only marks `Website.status = LIVE` after the
+- **Verified before serving.** The agent performs a real request through local
+  nginx with the site's Host header; the control plane only marks
+  `Website.status = ONLINE` after the
   agent reports `SUCCESS`.
 - **nginx safety.** Before reloading, the agent wraps the vhost snippet in a
   complete `http { }` config in a temp directory and runs `nginx -t`. If the
@@ -157,7 +194,7 @@ when unset):
         1001/        # immutable release (files + recorded nginx config)
         1002/
       current -> releases/1002   # symlink nginx serves
-      temp/                      # staging dir for the next release
+      tmp/                       # staging dir for the next release
 ```
 
 `AGENT_STORAGE` lets you separate control-plane artifact storage from
@@ -170,16 +207,16 @@ agent-managed release storage (e.g. a node-local disk) without changing code.
 - **Control plane:** `GET /health` (root) and `GET /internal/health` (both
   require the node bearer token on `/internal/*`). Return `{ status: "ok" }`.
 - **Agent:** `GET /health` (open). Returns a JSON status object.
-- **Per-site:** the agent `GET /v1/websites/:websiteId/status` returns the
-  live release number, status, and domains; used by the control plane during
-  deploy verification.
+- **Per-site:** the agent `GET /v1/websites/:websiteId/status?slug=<slug>`
+  returns whether a live release link exists. Successful deployment health is
+  additionally verified through local nginx before `SUCCESS` is reported.
 
 ---
 
 ## 6. Real End-to-End Verification
 
 A reproducible verifier (`apps/api/e2e-verify.mjs`) exercises the **full real
-lifecycle** against a running API + Node Agent. It performs 21 assertions,
+lifecycle** against a running API + Node Agent. It performs 20 assertions,
 including the critical safety properties.
 
 ### 6.1 Prerequisites
@@ -205,28 +242,10 @@ npm run start -w services/node-agent
 node apps/api/e2e-verify.mjs
 ```
 
-### 6.3 What it checks (21 assertions)
+### 6.3 What it checks (20 assertions)
 
-1. API `/health` responds.
-2. Node Agent `/health` responds.
-3. Agent rejects an unauthenticated `/v1` call (no token → 403).
-4. Agent accepts an authenticated `/v1` call (valid token → 200).
-5. Register a test user.
-6. Log in and obtain a session cookie.
-7. Create a website (provisions a node).
-8. Deploy an initial release (`1001`).
-9. `nginx -t` passes for the generated vhost.
-10. `current` symlink points at `releases/1001`.
-11. Site health check returns 200.
-12. `Website.status` becomes `LIVE`.
-13. Deploy a second release (`1002`).
-14. `current` switches to `releases/1002`.
-15. `1001` is preserved (immutable).
-16. Rollback to `1001`.
-17. `current` returns to `releases/1001`.
-18. Rollback is reflected in `Website` state.
-19. Failed-deploy path keeps the previous release live (verified in unit flow).
-20. Deployment logs are recorded.
-21. Cleanup removes the test website and its releases.
-
-**Result:** ✅ **21 / 21 checks passed** in the verified run.
+The verifier checks registration/session/login, website creation, two ZIP
+deployments, release numbers and on-disk content, `ONLINE` state, immutable
+release switching, rollback, and authenticated/unauthenticated agent access.
+The exact 20 assertion names live beside the workflow in
+`apps/api/e2e-verify.mjs`, preventing the documented count from drifting.

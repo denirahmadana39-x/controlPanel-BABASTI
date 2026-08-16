@@ -117,8 +117,8 @@ export function AuthLayout({
             Ship your sites to a live URL in minutes.
           </h1>
           <p className="mt-4 max-w-sm text-primary-foreground/80">
-            Deploy from ZIP or GitHub, get a free *.babasti.my.id domain, and
-            roll back instantly — all from one clean dashboard.
+            Upload a pre-built ZIP, get a *.babasti.my.id address, and roll back
+            instantly — all from one clean dashboard.
           </p>
         </div>
         <p className="text-sm text-primary-foreground/60">

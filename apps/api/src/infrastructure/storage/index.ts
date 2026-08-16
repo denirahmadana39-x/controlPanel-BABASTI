@@ -14,6 +14,7 @@ export interface ArtifactStorage {
   saveArtifact(key: string, data: Buffer): Promise<void>;
   readArtifact(key: string): Promise<Buffer>;
   exists(key: string): Promise<boolean>;
+  deleteArtifact(key: string): Promise<void>;
 }
 
 export class FileSystemArtifactStorage implements ArtifactStorage {
@@ -112,6 +113,19 @@ export class FileSystemArtifactStorage implements ArtifactStorage {
       throw new AppError(
         ErrorCode.ARTIFACT_READ_FAILED,
         "Artifact could not be inspected",
+        error,
+      );
+    }
+  }
+
+  async deleteArtifact(key: string): Promise<void> {
+    const full = this.resolve(key);
+    try {
+      await fs.rm(full, { force: true });
+    } catch (error) {
+      throw new AppError(
+        ErrorCode.ARTIFACT_WRITE_FAILED,
+        "Artifact could not be deleted",
         error,
       );
     }
