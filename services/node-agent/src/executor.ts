@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import { createWriteStream, accessSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import path from "node:path";
 import { open as openZip, type Entry, type ZipFile } from "yauzl";
 import {
@@ -412,13 +413,9 @@ export class NodeExecutor {
     let detail = "no response";
     for (let attempt = 1; attempt <= HEALTH_CHECK_ATTEMPTS; attempt += 1) {
       try {
-        const response = await fetch("http://127.0.0.1/", {
-          headers: { host: domain },
-          redirect: "manual",
-          signal: AbortSignal.timeout(3_000),
-        });
-        detail = `HTTP ${response.status}`;
-        if (response.status >= 200 && response.status < 400) {
+        const status = await requestLocalHttpStatus(domain);
+        detail = `HTTP ${status}`;
+        if (status >= 200 && status < 400) {
           return { success: true, detail };
         }
       } catch (error) {
@@ -430,6 +427,32 @@ export class NodeExecutor {
     }
     return { success: false, detail };
   }
+}
+
+export function requestLocalHttpStatus(
+  domain: string,
+  port = 80,
+): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const request = httpRequest(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: "/",
+        method: "GET",
+        headers: { Host: domain },
+      },
+      (response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      },
+    );
+    request.setTimeout(3_000, () => {
+      request.destroy(new Error("health check timed out"));
+    });
+    request.on("error", reject);
+    request.end();
+  });
 }
 
 // ---------- fs helpers (self-contained) ----------

@@ -1,12 +1,14 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { loadConfig } from "@babasti/config";
 import {
   NodeExecutor,
   preparePublishRoot,
+  requestLocalHttpStatus,
   rewriteNginxForValidation,
 } from "./executor.js";
 
@@ -119,4 +121,31 @@ test("publish root rejects configured paths outside the release", async () => {
     /publish directory escapes release root/,
   );
   await fs.rm(root, { recursive: true, force: true });
+});
+
+test("live health check sends the website domain as the HTTP Host header", async () => {
+  let receivedHost: string | undefined;
+  const server = createServer((request, response) => {
+    receivedHost = request.headers.host;
+    response.writeHead(204).end();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const status = await requestLocalHttpStatus(
+      "nested-site.babasti.my.id",
+      address.port,
+    );
+    assert.equal(status, 204);
+    assert.equal(receivedHost, "nested-site.babasti.my.id");
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
 });
