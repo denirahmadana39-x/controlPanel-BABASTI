@@ -14,9 +14,9 @@
     "db:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio",
     "seed": "tsx prisma/seed.ts",
-    "test": "tsx --import ./test/env.ts --test src/**/*.test.ts",
-    "test:watch": "tsx --import ./test/env.ts --test --watch src/**/*.test.ts",
-    "test:coverage": "tsx --import ./test/env.ts --test src/**/*.test.ts"
+    "test": "tsx --import ./test/env.ts --test \"src/**/*.test.ts\"",
+    "test:watch": "tsx --import ./test/env.ts --test --watch \"src/**/*.test.ts\"",
+    "test:coverage": "tsx --import ./test/env.ts --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@babasti/config": "1.0.0",

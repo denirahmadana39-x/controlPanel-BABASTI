@@ -187,7 +187,7 @@ and `CONTROL_PLANE_URL`).
 ### Automated tests
 
 ```powershell
-npm test   # 32 tests across zip, state machine, domain validation, auth, oauth, authorization, mock deployment, api flow
+npm test   # 38 tests: the original 32 plus 6 focused artifact-storage tests
 ```
 
 ### Real end-to-end verification

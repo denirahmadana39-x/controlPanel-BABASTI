@@ -18,6 +18,8 @@ Thumbs.db
 # Prisma generated client
 **/generated/
 
-# Local hosting storage (releases, nginx, sites)
-storage/
+# Local hosting storage (releases, nginx, sites) at the repo root only.
+# NOTE: do NOT ignore nested `storage/` dirs — the source module
+# apps/api/src/infrastructure/storage/ must remain tracked.
+/storage/
 

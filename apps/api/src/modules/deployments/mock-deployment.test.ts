@@ -18,6 +18,9 @@ import {
 import type { FastifyInstance } from "fastify";
 
 let app: FastifyInstance;
+// Track only the websites this file creates so cleanup never touches data
+// owned by concurrently-running test files (the shared test database).
+const created = new Set<string>();
 
 before(async () => {
   app = await buildTestApp();
@@ -29,16 +32,16 @@ after(async () => {
 });
 
 afterEach(async () => {
-  // Best-effort cleanup of any created websites between tests.
-  const sites = await prisma.website.findMany({ select: { id: true, slug: true } });
-  for (const s of sites) {
+  for (const id of created) {
+    const site = await prisma.website.findUnique({ where: { id } });
     try {
-      await prisma.website.delete({ where: { id: s.id } });
-      await fs.rm(siteRoot(s.slug), { recursive: true, force: true });
+      await prisma.website.delete({ where: { id } });
+      if (site) await fs.rm(siteRoot(site.slug), { recursive: true, force: true });
     } catch {
       /* ignore */
     }
   }
+  created.clear();
 });
 
 async function deployZip(app: FastifyInstance, cookies: string, websiteId: string, body: string) {
@@ -64,6 +67,7 @@ test("mock deploy: extracts files, creates a release, and goes ONLINE", async ()
     payload: { name: "md", slug, description: "t" },
   });
   const websiteId = (JSON.parse(w.body).data as { id: string }).id;
+  created.add(websiteId);
 
   const depId = await deployZip(app, cookies, websiteId, "<h1>v1</h1>");
   await runDeploy(depId);
@@ -103,6 +107,7 @@ test("mock rollback: reverts the live release to the previous one", async () => 
     payload: { name: "mdr", slug, description: "t" },
   });
   const websiteId = (JSON.parse(w.body).data as { id: string }).id;
+  created.add(websiteId);
 
   const dep1 = await deployZip(app, cookies, websiteId, "<h1>v1</h1>");
   await runDeploy(dep1);
@@ -144,6 +149,7 @@ test("mock deploy failure does not replace a working release", async () => {
     payload: { name: "mdf", slug, description: "t" },
   });
   const websiteId = (JSON.parse(w.body).data as { id: string }).id;
+  created.add(websiteId);
 
   const okDep = await deployZip(app, cookies, websiteId, "<h1>ok</h1>");
   await runDeploy(okDep);
