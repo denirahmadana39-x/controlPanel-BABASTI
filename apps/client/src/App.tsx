@@ -12,6 +12,7 @@ import { WebsitesPage } from "@/pages/WebsitesPage";
 import { CreateWebsitePage } from "@/pages/CreateWebsitePage";
 import { WebsiteDetailPage } from "@/pages/WebsiteDetailPage";
 import { SettingsPage } from "@/pages/SettingsPage";
+import { DASHBOARD_ROUTE_PATH } from "@/routing";
 
 export function App() {
   return (
@@ -37,7 +38,7 @@ export function App() {
                 }
               />
               <Route
-                path="/dashboard"
+                path={DASHBOARD_ROUTE_PATH}
                 element={
                   <ProtectedRoute>
                     <AppShell>
