@@ -53,6 +53,14 @@ const HEALTH_CHECK_ATTEMPTS = process.env.NODE_ENV === "test" ? 1 : 5;
 const HEALTH_CHECK_RETRY_MS = process.env.NODE_ENV === "test" ? 0 : 300;
 const MAX_ARCHIVE_ENTRIES = 10_000;
 const SAFE_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const IGNORED_PUBLISH_DIRECTORIES = new Set([
+  ".git",
+  ".github",
+  ".vscode",
+  "__MACOSX",
+  "coverage",
+  "node_modules",
+]);
 
 function delay(ms: number): Promise<void> {
   if (ms <= 0) return Promise.resolve();
@@ -244,22 +252,25 @@ export class NodeExecutor {
           : "";
         log(
           "ERROR",
-          publish.candidates.length > 1
-            ? `Multiple index.html files found; set the publish directory.${detail}`
-            : `No index.html found in the publish directory.${detail}`,
+          publish.reason === "ambiguous"
+            ? `Multiple HTML entry files found; set the publish directory.${detail}`
+            : `No HTML entry file found in the publish directory.${detail}`,
         );
         setStatus(DeploymentStatus.FAILED);
         state.result = {
           success: false,
           message:
-            publish.candidates.length > 1
-              ? "multiple publish directories contain index.html"
-              : "publish directory must contain index.html",
+            publish.reason === "ambiguous"
+              ? "multiple HTML entry files found"
+              : "publish directory must contain an HTML entry file",
         };
         return;
       }
       if (publish.sourceDirectory !== ".") {
         log("INFO", `Detected publish directory: ${publish.sourceDirectory}`);
+      }
+      if (publish.entryFile !== "index.html") {
+        log("INFO", `Detected HTML entrypoint: ${publish.entryFile}`);
       }
       log("INFO", "Build output validated");
 
@@ -546,13 +557,27 @@ export async function preparePublishRoot(
   target: string,
   outputDirectory?: string | null,
 ): Promise<
-  | { success: true; sourceDirectory: string; candidates: string[] }
-  | { success: false; candidates: string[] }
+  | {
+      success: true;
+      sourceDirectory: string;
+      entryFile: string;
+      candidates: string[];
+    }
+  | {
+      success: false;
+      reason: "missing" | "ambiguous";
+      candidates: string[];
+    }
 > {
   const resolvedTarget = path.resolve(target);
   const rootEntries = await fs.readdir(resolvedTarget).catch(() => [] as string[]);
   if (rootEntries.includes("index.html")) {
-    return { success: true, sourceDirectory: ".", candidates: ["index.html"] };
+    return {
+      success: true,
+      sourceDirectory: ".",
+      entryFile: "index.html",
+      candidates: ["index.html"],
+    };
   }
 
   if (outputDirectory) {
@@ -563,38 +588,25 @@ export async function preparePublishRoot(
     ) {
       throw new Error("publish directory escapes release root");
     }
-    const configuredEntries = await fs
-      .readdir(configured)
-      .catch(() => [] as string[]);
-    if (configuredEntries.includes("index.html")) {
-      await moveContents(configured, resolvedTarget);
-      await fs.rm(configured, { recursive: true, force: true });
-      return {
-        success: true,
-        sourceDirectory: path.relative(resolvedTarget, configured) || ".",
-        candidates: [
-          path.join(path.relative(resolvedTarget, configured), "index.html"),
-        ],
-      };
+    const configuredCandidates = await findHtmlFiles(
+      configured,
+      resolvedTarget,
+    );
+    if (configuredCandidates.length) {
+      return promoteHtmlEntrypoint(resolvedTarget, configuredCandidates);
     }
   }
 
-  const candidates = await findNestedIndexFiles(resolvedTarget);
-  if (candidates.length !== 1) return { success: false, candidates };
-
-  const detected = path.dirname(path.join(resolvedTarget, candidates[0]));
-  await moveContents(detected, resolvedTarget);
-  await fs.rm(detected, { recursive: true, force: true });
-  return {
-    success: true,
-    sourceDirectory: path.relative(resolvedTarget, detected) || ".",
-    candidates,
-  };
+  const candidates = await findHtmlFiles(resolvedTarget, resolvedTarget);
+  return promoteHtmlEntrypoint(resolvedTarget, candidates);
 }
 
-async function findNestedIndexFiles(root: string): Promise<string[]> {
+async function findHtmlFiles(
+  searchRoot: string,
+  releaseRoot: string,
+): Promise<string[]> {
   const candidates: string[] = [];
-  const pending = [root];
+  const pending = [searchRoot];
   while (pending.length) {
     const current = pending.pop()!;
     const entries = await fs
@@ -602,13 +614,50 @@ async function findNestedIndexFiles(root: string): Promise<string[]> {
       .catch(() => []);
     for (const entry of entries) {
       const absolute = path.join(current, entry.name);
-      if (entry.isDirectory()) pending.push(absolute);
-      else if (entry.isFile() && entry.name === "index.html") {
-        candidates.push(path.relative(root, absolute));
+      if (entry.isDirectory()) {
+        if (!IGNORED_PUBLISH_DIRECTORIES.has(entry.name)) {
+          pending.push(absolute);
+        }
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".html")) {
+        candidates.push(path.relative(releaseRoot, absolute));
       }
     }
   }
   return candidates.sort();
+}
+
+async function promoteHtmlEntrypoint(
+  root: string,
+  candidates: string[],
+): ReturnType<typeof preparePublishRoot> {
+  if (!candidates.length) {
+    return { success: false, reason: "missing", candidates };
+  }
+  const indexCandidates = candidates.filter(
+    (candidate) => path.basename(candidate).toLowerCase() === "index.html",
+  );
+  const viable = indexCandidates.length ? indexCandidates : candidates;
+  if (viable.length !== 1) {
+    return { success: false, reason: "ambiguous", candidates: viable };
+  }
+
+  const entryFile = viable[0];
+  const detected = path.dirname(path.join(root, entryFile));
+  const sourceDirectory = path.relative(root, detected) || ".";
+  const originalName = path.basename(entryFile);
+  if (detected !== root) {
+    await moveContents(detected, root);
+    await fs.rm(detected, { recursive: true, force: true });
+  }
+  if (originalName !== "index.html") {
+    await fs.rename(path.join(root, originalName), path.join(root, "index.html"));
+  }
+  return {
+    success: true,
+    sourceDirectory,
+    entryFile,
+    candidates,
+  };
 }
 
 async function createSymlink(target: string, link: string): Promise<void> {

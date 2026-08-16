@@ -65,7 +65,7 @@ test("rollback accepts only the release path matching its release number", async
 
 test("publish root automatically unwraps a single folder containing index.html", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "babasti-publish-"));
-  const wrapped = path.join(root, "anjaybisa");
+  const wrapped = path.join(root, "anjaybisa", "anjaybisa");
   await fs.mkdir(path.join(wrapped, "assets"), { recursive: true });
   await fs.writeFile(path.join(wrapped, "index.html"), "<h1>online</h1>");
   await fs.writeFile(path.join(wrapped, "assets", "app.js"), "ok");
@@ -74,8 +74,9 @@ test("publish root automatically unwraps a single folder containing index.html",
 
   assert.deepEqual(result, {
     success: true,
-    sourceDirectory: "anjaybisa",
-    candidates: [path.join("anjaybisa", "index.html")],
+    sourceDirectory: path.join("anjaybisa", "anjaybisa"),
+    entryFile: path.join("anjaybisa", "anjaybisa", "index.html"),
+    candidates: [path.join("anjaybisa", "anjaybisa", "index.html")],
   });
   assert.equal(await fs.readFile(path.join(root, "index.html"), "utf8"), "<h1>online</h1>");
   assert.equal(await fs.readFile(path.join(root, "assets", "app.js"), "utf8"), "ok");
@@ -106,10 +107,60 @@ test("publish root refuses to guess when multiple index files exist", async () =
 
   assert.deepEqual(result, {
     success: false,
+    reason: "ambiguous",
     candidates: [
       path.join("first", "index.html"),
       path.join("second", "index.html"),
     ],
+  });
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("publish root normalizes a deeply nested case-insensitive index file", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "babasti-publish-"));
+  const nested = path.join(root, "one", "two", "three");
+  await fs.mkdir(nested, { recursive: true });
+  await fs.writeFile(path.join(nested, "INDEX.HTML"), "case-insensitive");
+
+  const result = await preparePublishRoot(root);
+
+  assert.equal(result.success, true);
+  assert.equal(
+    await fs.readFile(path.join(root, "index.html"), "utf8"),
+    "case-insensitive",
+  );
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("publish root promotes the only HTML file when index.html is absent", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "babasti-publish-"));
+  const nested = path.join(root, "very", "deep", "site");
+  await fs.mkdir(nested, { recursive: true });
+  await fs.writeFile(path.join(nested, "home.html"), "home page");
+
+  const result = await preparePublishRoot(root);
+
+  assert.equal(result.success, true);
+  assert.equal(await fs.readFile(path.join(root, "index.html"), "utf8"), "home page");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("publish root ignores HTML files inside dependency directories", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "babasti-publish-"));
+  await fs.mkdir(path.join(root, "node_modules", "dependency"), {
+    recursive: true,
+  });
+  await fs.writeFile(
+    path.join(root, "node_modules", "dependency", "index.html"),
+    "dependency docs",
+  );
+
+  const result = await preparePublishRoot(root);
+
+  assert.deepEqual(result, {
+    success: false,
+    reason: "missing",
+    candidates: [],
   });
   await fs.rm(root, { recursive: true, force: true });
 });
