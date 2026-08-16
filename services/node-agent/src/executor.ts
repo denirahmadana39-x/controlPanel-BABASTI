@@ -48,6 +48,8 @@ export interface JobState {
 }
 
 const STEP_DELAY_MS = process.env.NODE_ENV === "test" ? 0 : 300;
+const HEALTH_CHECK_ATTEMPTS = process.env.NODE_ENV === "test" ? 1 : 5;
+const HEALTH_CHECK_RETRY_MS = process.env.NODE_ENV === "test" ? 0 : 300;
 const MAX_ARCHIVE_ENTRIES = 10_000;
 const SAFE_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
@@ -230,33 +232,35 @@ export class NodeExecutor {
         await fs.rm(staging, { force: true });
       }
 
-      const entries = await fs.readdir(target).catch(() => [] as string[]);
-      if (!entries.includes("index.html")) {
-        const out = input.build.outputDirectory;
-        if (out) {
-          const built = path.resolve(target, out);
-          if (!built.startsWith(`${path.resolve(target)}${path.sep}`)) {
-            throw new Error("publish directory escapes release root");
-          }
-          const builtEntries = await fs
-            .readdir(built)
-            .catch(() => [] as string[]);
-          if (builtEntries.includes("index.html")) {
-            await moveContents(built, target);
-          }
-        }
-        if (!(await fs.readdir(target).catch(() => [] as string[])).includes("index.html")) {
-          log("ERROR", "No index.html found in the publish directory");
-          setStatus(DeploymentStatus.FAILED);
-          state.result = {
-            success: false,
-            message: "publish directory must contain index.html",
-          };
-          return;
-        }
-      } else {
-        log("INFO", "Build output validated");
+      const publish = await preparePublishRoot(
+        target,
+        input.build.outputDirectory,
+      );
+      if (!publish.success) {
+        const candidates = publish.candidates.slice(0, 5).join(", ");
+        const detail = candidates
+          ? ` Candidates: ${candidates}`
+          : "";
+        log(
+          "ERROR",
+          publish.candidates.length > 1
+            ? `Multiple index.html files found; set the publish directory.${detail}`
+            : `No index.html found in the publish directory.${detail}`,
+        );
+        setStatus(DeploymentStatus.FAILED);
+        state.result = {
+          success: false,
+          message:
+            publish.candidates.length > 1
+              ? "multiple publish directories contain index.html"
+              : "publish directory must contain index.html",
+        };
+        return;
       }
+      if (publish.sourceDirectory !== ".") {
+        log("INFO", `Detected publish directory: ${publish.sourceDirectory}`);
+      }
+      log("INFO", "Build output validated");
 
       setStatus(DeploymentStatus.PUBLISHING);
       log("INFO", `Publishing release ${releaseNumber}`);
@@ -283,12 +287,19 @@ export class NodeExecutor {
       const liveLink = this.currentLink(slug);
       const previousTarget = await fs.readlink(liveLink).catch(() => null);
       await createSymlink(target, liveLink);
-      if (!(await this.healthCheck(input.domains[0], target))) {
+      const health = await this.healthCheck(input.domains[0], target);
+      if (!health.success) {
         if (previousTarget) await createSymlink(previousTarget, liveLink);
         else await fs.rm(liveLink, { force: true });
-        log("ERROR", "Published website did not pass its live health check");
+        log(
+          "ERROR",
+          `Published website did not pass its live health check (${health.detail})`,
+        );
         setStatus(DeploymentStatus.FAILED);
-        state.result = { success: false, message: "live health check failed" };
+        state.result = {
+          success: false,
+          message: `live health check failed (${health.detail})`,
+        };
         return;
       }
       log("INFO", "Deployment successful");
@@ -325,10 +336,14 @@ export class NodeExecutor {
       const liveLink = this.currentLink(input.slug);
       const previousTarget = await fs.readlink(liveLink).catch(() => null);
       await createSymlink(target, liveLink);
-      if (!(await this.healthCheck(input.domains[0], target))) {
+      const health = await this.healthCheck(input.domains[0], target);
+      if (!health.success) {
         if (previousTarget) await createSymlink(previousTarget, liveLink);
         else await fs.rm(liveLink, { force: true });
-        return { success: false, message: "live health check failed" };
+        return {
+          success: false,
+          message: `live health check failed (${health.detail})`,
+        };
       }
       return { success: true };
     } catch (error) {
@@ -379,21 +394,41 @@ export class NodeExecutor {
     }
   }
 
-  private async healthCheck(domain: string | undefined, target: string): Promise<boolean> {
+  private async healthCheck(
+    domain: string | undefined,
+    target: string,
+  ): Promise<{ success: boolean; detail: string }> {
     if (!this.nginxConfigDir) {
-      return fs.readdir(target).then((entries) => entries.length > 0).catch(() => false);
+      const success = await fs
+        .readdir(target)
+        .then((entries) => entries.length > 0)
+        .catch(() => false);
+      return {
+        success,
+        detail: success ? "release files present" : "release directory is empty",
+      };
     }
-    if (!domain) return false;
-    try {
-      const response = await fetch("http://127.0.0.1/", {
-        headers: { host: domain },
-        redirect: "manual",
-        signal: AbortSignal.timeout(10_000),
-      });
-      return response.status >= 200 && response.status < 400;
-    } catch {
-      return false;
+    if (!domain) return { success: false, detail: "domain is missing" };
+    let detail = "no response";
+    for (let attempt = 1; attempt <= HEALTH_CHECK_ATTEMPTS; attempt += 1) {
+      try {
+        const response = await fetch("http://127.0.0.1/", {
+          headers: { host: domain },
+          redirect: "manual",
+          signal: AbortSignal.timeout(3_000),
+        });
+        detail = `HTTP ${response.status}`;
+        if (response.status >= 200 && response.status < 400) {
+          return { success: true, detail };
+        }
+      } catch (error) {
+        detail = (error as Error).message || "request failed";
+      }
+      if (attempt < HEALTH_CHECK_ATTEMPTS) {
+        await delay(HEALTH_CHECK_RETRY_MS);
+      }
     }
+    return { success: false, detail };
   }
 }
 
@@ -482,6 +517,75 @@ async function moveContents(from: string, to: string): Promise<void> {
     if (e.name === "." || e.name === "..") continue;
     await fs.rename(path.join(from, e.name), path.join(to, e.name));
   }
+}
+
+export async function preparePublishRoot(
+  target: string,
+  outputDirectory?: string | null,
+): Promise<
+  | { success: true; sourceDirectory: string; candidates: string[] }
+  | { success: false; candidates: string[] }
+> {
+  const resolvedTarget = path.resolve(target);
+  const rootEntries = await fs.readdir(resolvedTarget).catch(() => [] as string[]);
+  if (rootEntries.includes("index.html")) {
+    return { success: true, sourceDirectory: ".", candidates: ["index.html"] };
+  }
+
+  if (outputDirectory) {
+    const configured = path.resolve(resolvedTarget, outputDirectory);
+    if (
+      configured !== resolvedTarget &&
+      !configured.startsWith(`${resolvedTarget}${path.sep}`)
+    ) {
+      throw new Error("publish directory escapes release root");
+    }
+    const configuredEntries = await fs
+      .readdir(configured)
+      .catch(() => [] as string[]);
+    if (configuredEntries.includes("index.html")) {
+      await moveContents(configured, resolvedTarget);
+      await fs.rm(configured, { recursive: true, force: true });
+      return {
+        success: true,
+        sourceDirectory: path.relative(resolvedTarget, configured) || ".",
+        candidates: [
+          path.join(path.relative(resolvedTarget, configured), "index.html"),
+        ],
+      };
+    }
+  }
+
+  const candidates = await findNestedIndexFiles(resolvedTarget);
+  if (candidates.length !== 1) return { success: false, candidates };
+
+  const detected = path.dirname(path.join(resolvedTarget, candidates[0]));
+  await moveContents(detected, resolvedTarget);
+  await fs.rm(detected, { recursive: true, force: true });
+  return {
+    success: true,
+    sourceDirectory: path.relative(resolvedTarget, detected) || ".",
+    candidates,
+  };
+}
+
+async function findNestedIndexFiles(root: string): Promise<string[]> {
+  const candidates: string[] = [];
+  const pending = [root];
+  while (pending.length) {
+    const current = pending.pop()!;
+    const entries = await fs
+      .readdir(current, { withFileTypes: true })
+      .catch(() => []);
+    for (const entry of entries) {
+      const absolute = path.join(current, entry.name);
+      if (entry.isDirectory()) pending.push(absolute);
+      else if (entry.isFile() && entry.name === "index.html") {
+        candidates.push(path.relative(root, absolute));
+      }
+    }
+  }
+  return candidates.sort();
 }
 
 async function createSymlink(target: string, link: string): Promise<void> {

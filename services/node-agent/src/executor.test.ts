@@ -1,8 +1,14 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { loadConfig } from "@babasti/config";
-import { NodeExecutor, rewriteNginxForValidation } from "./executor.js";
+import {
+  NodeExecutor,
+  preparePublishRoot,
+  rewriteNginxForValidation,
+} from "./executor.js";
 
 after(async () => {
   await fs.rm(loadConfig().agentStoragePath, { recursive: true, force: true });
@@ -53,4 +59,64 @@ test("rollback accepts only the release path matching its release number", async
     releaseNumber: 1001,
   });
   assert.deepEqual(result, { success: false, message: "invalid release path" });
+});
+
+test("publish root automatically unwraps a single folder containing index.html", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "babasti-publish-"));
+  const wrapped = path.join(root, "anjaybisa");
+  await fs.mkdir(path.join(wrapped, "assets"), { recursive: true });
+  await fs.writeFile(path.join(wrapped, "index.html"), "<h1>online</h1>");
+  await fs.writeFile(path.join(wrapped, "assets", "app.js"), "ok");
+
+  const result = await preparePublishRoot(root);
+
+  assert.deepEqual(result, {
+    success: true,
+    sourceDirectory: "anjaybisa",
+    candidates: [path.join("anjaybisa", "index.html")],
+  });
+  assert.equal(await fs.readFile(path.join(root, "index.html"), "utf8"), "<h1>online</h1>");
+  assert.equal(await fs.readFile(path.join(root, "assets", "app.js"), "utf8"), "ok");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("publish root honors an explicitly configured nested directory", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "babasti-publish-"));
+  const built = path.join(root, "project", "dist");
+  await fs.mkdir(built, { recursive: true });
+  await fs.writeFile(path.join(built, "index.html"), "<h1>dist</h1>");
+
+  const result = await preparePublishRoot(root, path.join("project", "dist"));
+
+  assert.equal(result.success, true);
+  assert.equal(await fs.readFile(path.join(root, "index.html"), "utf8"), "<h1>dist</h1>");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("publish root refuses to guess when multiple index files exist", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "babasti-publish-"));
+  await fs.mkdir(path.join(root, "first"), { recursive: true });
+  await fs.mkdir(path.join(root, "second"), { recursive: true });
+  await fs.writeFile(path.join(root, "first", "index.html"), "first");
+  await fs.writeFile(path.join(root, "second", "index.html"), "second");
+
+  const result = await preparePublishRoot(root);
+
+  assert.deepEqual(result, {
+    success: false,
+    candidates: [
+      path.join("first", "index.html"),
+      path.join("second", "index.html"),
+    ],
+  });
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("publish root rejects configured paths outside the release", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "babasti-publish-"));
+  await assert.rejects(
+    preparePublishRoot(root, "../outside"),
+    /publish directory escapes release root/,
+  );
+  await fs.rm(root, { recursive: true, force: true });
 });
